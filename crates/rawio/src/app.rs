@@ -92,6 +92,7 @@ fn probe(
     writeln!(out, "target: {}", describe(&info)).map_err(|e| Error::io("writing output", e))?;
     writeln!(out, "writable: {}", info.removability.writable())
         .map_err(|e| Error::io("writing output", e))?;
+    rehearse(args, backend, out, trace, &info)?;
 
     if args.pit {
         let table = read_pit(&mut *device, opts.pit_at, trace)?;
@@ -107,6 +108,50 @@ fn probe(
         .map_err(|e| Error::io("writing output", e))?;
     }
     Ok(())
+}
+
+/// Runs the write path as far as it goes without writing, so the answer to
+/// "would a flash be permitted here" does not cost a card to find out.
+fn rehearse(
+    args: &ProbeArgs,
+    backend: &dyn Backend,
+    out: &mut dyn Write,
+    trace: &Trace,
+    info: &DeviceInfo,
+) -> Result<()> {
+    let io = |e| Error::io("writing output", e);
+
+    if !info.removability.writable() {
+        return writeln!(
+            out,
+            "write rehearsal: skipped, {} is not removable and would be refused",
+            info.id
+        )
+        .map_err(io);
+    }
+
+    match backend.rehearse_write(&args.device, trace) {
+        Err(err) => writeln!(out, "write rehearsal: no writable handle - {err}").map_err(io),
+        Ok(volumes) if volumes.is_empty() => writeln!(
+            out,
+            "write rehearsal: writable handle taken; the OS has no volume mounted on this device"
+        )
+        .map_err(io),
+        Ok(volumes) => {
+            writeln!(out, "write rehearsal: writable handle taken").map_err(io)?;
+            for volume in &volumes {
+                match (volume.locked, &volume.error) {
+                    (true, _) => writeln!(out, "  volume {} locked", volume.volume),
+                    (false, Some(err)) => {
+                        writeln!(out, "  volume {} NOT locked - {err}", volume.volume)
+                    }
+                    (false, None) => writeln!(out, "  volume {} NOT locked", volume.volume),
+                }
+                .map_err(io)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Reads the partition table and nothing else.

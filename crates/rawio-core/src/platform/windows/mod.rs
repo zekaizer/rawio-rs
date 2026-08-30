@@ -6,7 +6,7 @@ pub mod logic;
 #[cfg(windows)]
 mod sys;
 
-use crate::device::{Access, Backend, DeviceInfo, RawDevice};
+use crate::device::{Access, Backend, DeviceInfo, RawDevice, VolumeLock};
 use crate::error::{DeviceError, Stage};
 use crate::trace::Trace;
 
@@ -47,6 +47,20 @@ impl Backend for WindowsBackend {
         #[cfg(not(windows))]
         {
             let _ = (index, access, trace);
+            Err(host_required(Stage::Open))
+        }
+    }
+
+    fn rehearse_write(&self, id: &str, trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
+        let index =
+            logic::parse_device_id(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
+        #[cfg(windows)]
+        {
+            sys::rehearse_write(index, trace)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (index, trace);
             Err(host_required(Stage::Open))
         }
     }

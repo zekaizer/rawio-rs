@@ -51,6 +51,17 @@ pub trait RawDevice {
     fn flush(&mut self) -> Result<(), DeviceError>;
 }
 
+/// What stands between a write and the medium on one volume the OS has mounted
+/// over the target device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeLock {
+    /// How the OS names the volume, in the form the user will recognise.
+    pub volume: String,
+    pub locked: bool,
+    /// Why it could not be locked, when it could not.
+    pub error: Option<DeviceError>,
+}
+
 /// The trace is passed in because opening a device is itself several steps, and
 /// which one failed is the whole point of the report.
 pub trait Backend {
@@ -61,6 +72,15 @@ pub trait Backend {
         access: Access,
         trace: &Trace,
     ) -> Result<Box<dyn RawDevice>, DeviceError>;
+
+    /// Runs the write path as far as it can without writing: takes a writable
+    /// handle, tries the volume locks a write would need, then releases both.
+    /// The point is to learn on site whether a write would be permitted without
+    /// risking a card to find out.
+    fn rehearse_write(&self, id: &str, trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
+        let _ = (id, trace);
+        Ok(Vec::new())
+    }
 }
 
 /// In-memory device backing the transfer, alignment and PIT tests.

@@ -39,6 +39,9 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - No interactive prompts, ever. Every failure exits non-zero with the stage and
   the raw OS error code.
 - `flash` has no removable-check override. Do not add one.
+- Locking a volume stops Windows writing over the transfer; only dismounting it
+  makes Windows forget the filesystem the transfer just replaced. Do both, and
+  do neither during a rehearsal.
 - `--input` / `--output` reach the OS verbatim. Do not rewrite them: the WSL
   shares, `\\?\` and UNC are all valid Windows paths that any translation
   layer would break. Device arguments keep their own per-backend syntax. The one

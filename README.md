@@ -82,6 +82,31 @@ extended-length form (`\\?\C:\...`, `\\?\UNC\server\share\...`) just before the
 file is opened, so a deeply nested WSL path works without the caller doing
 anything. Shorter paths are opened exactly as typed.
 
+## Writing under a mounted volume
+
+On Windows a write through a physical disk handle is refused where a mounted
+volume covers those sectors, unless that volume is locked. `flash` locks every
+volume the OS has mounted on the target device and holds the lock until it is
+done, then dismounts it: a lock stops Windows writing over the transfer, but
+only a dismount makes it forget the filesystem it had cached, which a raw write
+has just replaced. Sectors outside every mounted volume are writable either way.
+
+A lock needs exclusive access and fails if anything holds a file open on that
+volume, so `probe` rehearses the whole thing - writable handle, then the locks -
+and releases it again without writing, which answers whether a `flash` would be
+permitted before a card is at stake:
+
+```
+target: \\.\PhysicalDrive2  29.7 GiB  removable  sector=512  Generic SD/MMC
+writable: true
+write rehearsal: writable handle taken
+  volume \\.\E: locked
+  volume \\.\F: NOT locked - [lock-volume] access denied (os error 5)
+```
+
+The rehearsal is skipped on a device that is not removable, since the write
+would be refused anyway.
+
 ## Safety
 
 `flash` refuses any device that is not reported as removable. There is no

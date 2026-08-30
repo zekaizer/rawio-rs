@@ -1,7 +1,7 @@
 //! Linux backend. Geometry and removability come from sysfs rather than ioctls,
 //! so the only thing that needs a real Linux host is opening `/dev/<name>`.
 
-use crate::device::{Access, Backend, DeviceInfo, RawDevice, Removability};
+use crate::device::{Access, Backend, DeviceInfo, RawDevice, Removability, VolumeLock};
 use crate::error::{DeviceError, Stage};
 use crate::trace::Trace;
 
@@ -50,6 +50,22 @@ impl Backend for LinuxBackend {
         })?;
         trace.ok(Stage::Open, format!("/dev/{name}"), "handle acquired");
         Ok(device)
+    }
+
+    /// Linux has no volume lock to take: a raw write to a device with a mounted
+    /// filesystem is permitted. Taking a writable handle is the whole check.
+    fn rehearse_write(&self, id: &str, trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
+        let name = device_name(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
+        let device = open_device(&name, Access::ReadWrite).inspect_err(|err| {
+            trace.failed(format!("/dev/{name}"), err);
+        })?;
+        drop(device);
+        trace.ok(
+            Stage::Open,
+            format!("/dev/{name}"),
+            "read-write, for rehearsal only",
+        );
+        Ok(Vec::new())
     }
 }
 

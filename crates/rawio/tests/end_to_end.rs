@@ -8,18 +8,22 @@ use std::rc::Rc;
 use clap::Parser;
 use rawio::app;
 use rawio::cli::Cli;
-use rawio_core::device::{Access, Backend, DeviceInfo, MemoryDevice, RawDevice, Removability};
+use rawio_core::device::{
+    Access, Backend, DeviceInfo, MemoryDevice, RawDevice, Removability, VolumeLock,
+};
 use rawio_core::error::{DeviceError, Error, Stage};
 use rawio_core::trace::Trace;
 
 struct FakeBackend {
     device: Rc<RefCell<MemoryDevice>>,
+    volumes: Vec<VolumeLock>,
 }
 
 impl FakeBackend {
     fn new(size: usize, removability: Removability) -> Self {
         Self {
             device: Rc::new(RefCell::new(MemoryDevice::new("mem0", size, removability))),
+            volumes: Vec::new(),
         }
     }
 }
@@ -27,6 +31,10 @@ impl FakeBackend {
 impl Backend for FakeBackend {
     fn enumerate(&self, _trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
         Ok(vec![self.device.borrow().info().clone()])
+    }
+
+    fn rehearse_write(&self, _id: &str, _trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
+        Ok(self.volumes.clone())
     }
 
     fn open(
@@ -305,6 +313,51 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
         std::fs::read(&by_name).unwrap(),
         std::fs::read(&by_id).unwrap()
     );
+}
+
+#[test]
+fn probe_rehearses_the_volume_locks_a_write_would_need() {
+    let mut backend = FakeBackend::new(1 << 20, Removability::Removable);
+    backend.volumes = vec![
+        VolumeLock {
+            volume: "E:".into(),
+            locked: true,
+            error: None,
+        },
+        VolumeLock {
+            volume: "F:".into(),
+            locked: false,
+            error: Some(DeviceError::with_os_error(
+                Stage::LockVolume,
+                "access denied",
+                5,
+            )),
+        },
+    ];
+
+    let (result, out) = run(&["rawio", "probe", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("E:") && out.contains("F:"), "{out}");
+    assert!(out.contains("os error 5"), "{out}");
+    // The card is untouched either way.
+    assert!(backend.device.borrow().contents().iter().all(|b| *b == 0));
+}
+
+#[test]
+fn probe_does_not_rehearse_a_write_it_would_refuse() {
+    let mut backend = FakeBackend::new(1 << 20, Removability::Fixed);
+    backend.volumes = vec![VolumeLock {
+        volume: "C:".into(),
+        locked: true,
+        error: None,
+    }];
+
+    let (result, out) = run(&["rawio", "probe", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(!out.contains("C:"), "{out}");
+    assert!(out.to_lowercase().contains("not removable"), "{out}");
 }
 
 #[test]

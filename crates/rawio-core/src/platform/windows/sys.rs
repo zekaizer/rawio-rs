@@ -8,7 +8,7 @@ use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use super::logic;
-use crate::device::{Access, DeviceInfo, RawDevice, Removability};
+use crate::device::{Access, DeviceInfo, RawDevice, Removability, VolumeLock};
 use crate::error::{DeviceError, Stage};
 use crate::trace::Trace;
 
@@ -57,7 +57,10 @@ pub fn open(index: u32, access: Access, trace: &Trace) -> Result<Box<dyn RawDevi
 
     // Never lock volumes on a device the caller is about to be refused.
     let locks = if write && info.removability.writable() {
-        lock_volumes_on(index, trace)
+        // Dismounting invalidates what the OS has cached about the filesystem.
+        // Without it a raw write under a mounted volume leaves Windows holding
+        // metadata that no longer describes the medium.
+        lock_volumes_on(index, trace, Dismount::Yes).0
     } else {
         Vec::new()
     };
@@ -134,12 +137,42 @@ fn describe(index: u32, file: &File, trace: &Trace) -> DeviceInfo {
     }
 }
 
+/// Rehearses the write path and undoes it: a writable handle plus the volume
+/// locks a write would need, then both released. Nothing is written.
+pub fn rehearse_write(index: u32, trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
+    let path = logic::physical_drive_path(index);
+    let handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|err| {
+            let err = DeviceError::from_io(Stage::Open, &err);
+            trace.failed(&path, &err);
+            err
+        })?;
+    trace.ok(Stage::Open, &path, "read-write, for rehearsal only");
+
+    let (locks, report) = lock_volumes_on(index, trace, Dismount::No);
+    drop(locks);
+    drop(handle);
+    Ok(report)
+}
+
+/// Whether the volume is also taken offline, which a real write needs and a
+/// rehearsal must not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dismount {
+    Yes,
+    No,
+}
+
 /// A write through a physical disk handle is refused where a mounted volume
 /// covers it, so every volume on this disk is locked first and stays locked for
 /// as long as its handle is open. A failure here is not fatal: an unformatted
 /// card has nothing to lock, and the write may still succeed.
-fn lock_volumes_on(disk: u32, trace: &Trace) -> Vec<File> {
+fn lock_volumes_on(disk: u32, trace: &Trace, dismount: Dismount) -> (Vec<File>, Vec<VolumeLock>) {
     let mut locked = Vec::new();
+    let mut report = Vec::new();
     for letter in 'A'..='Z' {
         let path = logic::volume_path(letter);
         let Ok(volume) = OpenOptions::new().read(true).write(true).open(&path) else {
@@ -160,12 +193,36 @@ fn lock_volumes_on(disk: u32, trace: &Trace) -> Vec<File> {
         match control(&volume, logic::FSCTL_LOCK_VOLUME, &[], 0, Stage::LockVolume) {
             Ok(_) => {
                 trace.ok(Stage::LockVolume, &path, "locked");
+                if dismount == Dismount::Yes {
+                    match control(
+                        &volume,
+                        logic::FSCTL_DISMOUNT_VOLUME,
+                        &[],
+                        0,
+                        Stage::LockVolume,
+                    ) {
+                        Ok(_) => trace.ok(Stage::LockVolume, &path, "dismounted"),
+                        Err(err) => trace.failed(format!("{path} dismount"), &err),
+                    }
+                }
+                report.push(VolumeLock {
+                    volume: path,
+                    locked: true,
+                    error: None,
+                });
                 locked.push(volume);
             }
-            Err(err) => trace.failed(&path, &err),
+            Err(err) => {
+                trace.failed(&path, &err);
+                report.push(VolumeLock {
+                    volume: path,
+                    locked: false,
+                    error: Some(err),
+                });
+            }
         }
     }
-    locked
+    (locked, report)
 }
 
 fn control(
