@@ -1,0 +1,184 @@
+//! Failure classification. Every failure carries the stage it happened in and,
+//! where the OS produced one, the raw error code - a single run's output has to
+//! be enough to locate a failure without reproducing it.
+
+use std::fmt;
+
+/// Device access steps reported by `--trace` and named in every `DeviceError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Enumerate,
+    Open,
+    QueryGeometry,
+    LockVolume,
+    Seek,
+    Read,
+    Write,
+    Flush,
+    ParsePit,
+}
+
+impl Stage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Stage::Enumerate => "enumerate-devices",
+            Stage::Open => "open-device",
+            Stage::QueryGeometry => "query-geometry",
+            Stage::LockVolume => "lock-volume",
+            Stage::Seek => "seek",
+            Stage::Read => "read",
+            Stage::Write => "write",
+            Stage::Flush => "flush",
+            Stage::ParsePit => "parse-pit",
+        }
+    }
+}
+
+impl fmt::Display for Stage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A failed device access. `os_error` is the platform's own code (Win32 error
+/// or errno), kept unmapped so the value in the output matches OS documentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceError {
+    pub stage: Stage,
+    pub message: String,
+    pub os_error: Option<i32>,
+}
+
+impl DeviceError {
+    pub fn new(stage: Stage, message: impl Into<String>) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+            os_error: None,
+        }
+    }
+
+    pub fn with_os_error(stage: Stage, message: impl Into<String>, os_error: i32) -> Self {
+        Self {
+            stage,
+            message: message.into(),
+            os_error: Some(os_error),
+        }
+    }
+
+    pub fn from_io(stage: Stage, err: &std::io::Error) -> Self {
+        Self {
+            stage,
+            message: err.to_string(),
+            os_error: err.raw_os_error(),
+        }
+    }
+}
+
+impl fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}", self.stage, self.message)?;
+        match self.os_error {
+            Some(code) => write!(f, " (os error {code})"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for DeviceError {}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Device(#[from] DeviceError),
+
+    /// Fixed disks are rejected before any write is attempted.
+    #[error("refusing to write: {device} is not a removable device ({classification})")]
+    NotRemovable {
+        device: String,
+        classification: &'static str,
+    },
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("PIT: {0}")]
+    Pit(String),
+
+    /// The device is left partially written; `written` bytes landed at `start`.
+    #[error("write aborted after {written} bytes written at offset {start}: {source}")]
+    WriteAborted {
+        start: u64,
+        written: u64,
+        source: DeviceError,
+    },
+
+    #[error("not supported on this platform: {0}")]
+    Unsupported(&'static str),
+
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
+}
+
+impl Error {
+    pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Error::Io {
+            context: context.into(),
+            source,
+        }
+    }
+
+    /// The exit code alone must separate the failure classes a script cares about.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Error::InvalidArgument(_) => 2,
+            Error::Device(_) | Error::Io { .. } | Error::Pit(_) => 3,
+            Error::NotRemovable { .. } => 4,
+            Error::WriteAborted { .. } => 5,
+            Error::Unsupported(_) => 6,
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_error_display_carries_stage_and_os_code() {
+        let err = DeviceError::with_os_error(Stage::LockVolume, "access denied", 5);
+        assert_eq!(err.to_string(), "[lock-volume] access denied (os error 5)");
+    }
+
+    #[test]
+    fn exit_codes_separate_failure_classes() {
+        let cases = [
+            (Error::InvalidArgument("x".into()), 2u8),
+            (Error::Device(DeviceError::new(Stage::Open, "x")), 3),
+            (
+                Error::NotRemovable {
+                    device: "d".into(),
+                    classification: "fixed",
+                },
+                4,
+            ),
+            (
+                Error::WriteAborted {
+                    start: 0,
+                    written: 512,
+                    source: DeviceError::new(Stage::Write, "x"),
+                },
+                5,
+            ),
+            (Error::Unsupported("x"), 6),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.exit_code(), expected, "{err}");
+        }
+    }
+}
