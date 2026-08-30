@@ -335,6 +335,13 @@ fn verify(
     let mut device = backend.open(&args.device, Access::Read, trace)?;
     let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
         .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    if let Some(limit) = range.length
+        && length > limit
+    {
+        return Err(Error::InvalidArgument(format!(
+            "input is {length} bytes but the target range is {limit} bytes"
+        )));
+    }
 
     if opts.dry_run {
         let end = transfer::check_range(device.info(), range.offset, length)?;

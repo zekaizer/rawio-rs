@@ -624,6 +624,34 @@ fn verify_names_the_first_byte_that_differs() {
     assert!(message.contains("4196"), "{message}");
 }
 
+/// A file longer than the partition would be compared into the neighbouring
+/// partition; flash refuses that input, so verify has to as well.
+#[test]
+fn verify_rejects_input_longer_than_the_partition() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("LOG", 64, 128)]);
+    let input = tempdir("verifytoolong").join("big.bin");
+    std::fs::write(&input, vec![0u8; 128 << 10]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--partition",
+            "LOG",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
 /// Verify walks the same device ranges the transfers do, so it has to refuse
 /// exactly what they refuse instead of failing later with a raw device error.
 #[test]
