@@ -189,7 +189,21 @@ pub fn flash(
         let mut last_flushed = 0u64;
 
         for message in ready {
-            let (mut buf, want) = message.map_err(|err| Error::io("reading input file", err))?;
+            let (mut buf, want) = match message {
+                Ok(chunk) => chunk,
+                // Nothing written yet is a plain input failure; after that the
+                // card is partially written, so the cache is pushed at the
+                // medium and the error carries how much landed.
+                Err(err) if done == 0 => {
+                    return Err(Error::io("reading input file", err));
+                }
+                Err(err) => {
+                    push(device, offset, done, trace)?;
+                    let mut source = DeviceError::from_io(Stage::Read, &err);
+                    source.message = format!("reading input file: {}", source.message);
+                    return Err(abort(offset, done, source));
+                }
+            };
             let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
             let at = offset + done;
 
@@ -520,6 +534,58 @@ mod tests {
 
         assert!(matches!(err, Error::Io { .. }), "{err}");
         assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The card holds every chunk that landed before the source died, so the
+    /// error has to say how much, and the cache has to be pushed at the medium
+    /// so that count describes the card rather than memory.
+    #[test]
+    fn a_source_failure_mid_flash_reports_and_flushes_what_landed() {
+        struct DiesAfter {
+            data: Vec<u8>,
+            served: usize,
+        }
+        impl Read for DiesAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.served >= self.data.len() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let n = buf.len().min(self.data.len() - self.served);
+                buf[..n].copy_from_slice(&self.data[self.served..self.served + n]);
+                self.served += n;
+                Ok(n)
+            }
+        }
+
+        let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+        let mut source = DiesAfter {
+            data: pattern(1 << 20),
+            served: 0,
+        };
+
+        let err = flash(
+            &mut device,
+            4096,
+            2 << 20,
+            &mut source,
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        match err {
+            Error::WriteAborted {
+                start,
+                written,
+                ref source,
+            } => {
+                assert_eq!(start, 4096);
+                assert_eq!(written, 1 << 20);
+                assert!(source.message.contains("reading input file"), "{source}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(device.flushes(), 1);
     }
 
     #[test]

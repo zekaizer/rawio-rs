@@ -92,6 +92,7 @@ pub struct MemoryDevice {
     fail_write_at: Option<u64>,
     /// Offset at which the next read fails, simulating a vanished device.
     fail_read_at: Option<u64>,
+    flushes: usize,
 }
 
 impl MemoryDevice {
@@ -107,7 +108,12 @@ impl MemoryDevice {
             data: vec![0; size],
             fail_write_at: None,
             fail_read_at: None,
+            flushes: 0,
         }
+    }
+
+    pub fn flushes(&self) -> usize {
+        self.flushes
     }
 
     pub fn fail_writes_from(&mut self, offset: u64) {
@@ -177,6 +183,7 @@ impl RawDevice for MemoryDevice {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
+        self.flushes += 1;
         Ok(())
     }
 }
