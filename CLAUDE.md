@@ -27,6 +27,10 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - Windows-specific logic must stay testable on a non-Windows host. Anything that
   is not a syscall goes in a module without a `cfg` gate, behind a trait the
   tests can fake. Unit tests passing is not evidence that Windows works.
+- Transfers overlap their two sides with a scoped thread and a bounded channel.
+  The device stays on the calling thread because `RawDevice` and `Trace` are not
+  `Send`; only the file side moves. Buffer recycling is best effort and must
+  never be read as a signal to stop.
 - A write is not done when the buffer accepts it. `flash` flushes as it goes so
   the progress report tracks the medium; do not move back to a single flush at
   the end.

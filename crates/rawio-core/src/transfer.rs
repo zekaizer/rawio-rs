@@ -2,6 +2,8 @@
 //! on every platform and in tests.
 
 use std::io::{Read, Write};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::device::{DeviceInfo, RawDevice};
 use crate::error::{DeviceError, Error, Result, Stage};
@@ -10,6 +12,10 @@ use crate::trace::Trace;
 
 /// Transfer granularity. Always a multiple of any plausible sector size.
 const CHUNK: usize = 1 << 20;
+
+/// Chunks that may be in flight between the two sides of a transfer. Two is
+/// enough to keep both busy; more only holds more memory.
+const DEPTH: usize = 2;
 
 /// How much may sit in the page cache before it is pushed at the medium.
 ///
@@ -69,7 +75,7 @@ pub fn dump(
     device: &mut dyn RawDevice,
     offset: u64,
     length: u64,
-    sink: &mut dyn Write,
+    sink: &mut (dyn Write + Send),
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
@@ -77,27 +83,65 @@ pub fn dump(
     require_aligned("offset", offset, sector)?;
     ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
-    let mut buf = vec![0u8; CHUNK];
-    let mut done = 0u64;
-    while done < length {
-        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
-        let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
-        let at = offset + done;
-        let chunk = &mut buf[..aligned];
-        device.read_at(at, chunk).map_err(|err| {
-            trace.failed(format!("read {aligned}B at {at}"), &err);
-            Error::Device(err)
-        })?;
-        trace.ok(Stage::Read, format!("read {aligned}B at {at}"), "ok");
-        sink.write_all(&chunk[..want])
-            .map_err(|err| Error::io("writing output file", err))?;
-        done += want as u64;
-        progress.advance(done, length);
-    }
-    sink.flush()
-        .map_err(|err| Error::io("flushing output file", err))?;
-    progress.finish(done);
-    Ok(done)
+    // The sink runs on its own thread so the next device read overlaps the write
+    // of the chunk before it. The device stays here: `RawDevice` is not `Send`,
+    // and neither is the trace it writes to.
+    thread::scope(|scope| {
+        let (filled, ready) = mpsc::sync_channel::<(Vec<u8>, usize)>(DEPTH);
+        let (recycled, spare) = mpsc::channel::<Vec<u8>>();
+        let refill = recycled.clone();
+
+        let writer = scope.spawn(move || -> Result<()> {
+            for (buf, want) in ready {
+                sink.write_all(&buf[..want])
+                    .map_err(|err| Error::io("writing output file", err))?;
+                // Recycling is best effort: the other side may already be done
+                // with this transfer, which is not a reason to stop writing.
+                let _ = recycled.send(buf);
+            }
+            sink.flush()
+                .map_err(|err| Error::io("flushing output file", err))
+        });
+
+        for _ in 0..DEPTH + 1 {
+            let _ = refill.send(vec![0u8; CHUNK]);
+        }
+        drop(refill);
+
+        let mut done = 0u64;
+        let mut failure = None;
+        while done < length {
+            let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
+            let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
+            let at = offset + done;
+
+            // A disconnected spare channel means the writer stopped; its error
+            // is the one worth reporting, so let the join produce it.
+            let Ok(mut buf) = spare.recv() else { break };
+
+            if let Err(err) = device.read_at(at, &mut buf[..aligned]) {
+                trace.failed(format!("read {aligned}B at {at}"), &err);
+                failure = Some(Error::Device(err));
+                break;
+            }
+            trace.ok(Stage::Read, format!("read {aligned}B at {at}"), "ok");
+
+            if filled.send((buf, want)).is_err() {
+                break;
+            }
+            done += want as u64;
+            progress.advance(done, length);
+        }
+        drop(filled);
+
+        let written = writer.join().expect("output writer panicked");
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        written?;
+        progress.finish(done);
+        Ok(done)
+    })
 }
 
 /// On failure the last successfully written offset is carried in the error.
@@ -105,7 +149,7 @@ pub fn flash(
     device: &mut dyn RawDevice,
     offset: u64,
     length: u64,
-    source: &mut dyn Read,
+    source: &mut (dyn Read + Send),
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
@@ -114,64 +158,102 @@ pub fn flash(
     require_aligned("offset", offset, sector)?;
     ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
-    let mut buf = vec![0u8; CHUNK];
-    let mut done = 0u64;
-    let mut last_flushed = 0u64;
-    while done < length {
-        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
-        let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
-        let at = offset + done;
-
-        // The tail sector is read first so padding preserves whatever follows the image.
-        if aligned > want {
-            read_back(device, at, &mut buf[..aligned], trace)
-                .map_err(|err| abort(at, done, err))?;
+    // Mirror of dump: the source is read on its own thread so the file read of
+    // the next chunk overlaps the device write of this one.
+    thread::scope(|scope| {
+        let (filled, ready) = mpsc::sync_channel::<std::io::Result<(Vec<u8>, usize)>>(DEPTH);
+        let (recycled, spare) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..DEPTH + 1 {
+            let _ = recycled.send(vec![0u8; CHUNK]);
         }
-        source
-            .read_exact(&mut buf[..want])
-            .map_err(|err| Error::io("reading input file", err))?;
 
-        device.write_at(at, &buf[..aligned]).map_err(|err| {
-            trace.failed(format!("write {aligned}B at {at}"), &err);
-            abort(offset, done, err)
-        })?;
-        trace.ok(Stage::Write, format!("write {aligned}B at {at}"), "ok");
-        done += want as u64;
-        progress.advance(done, length);
+        scope.spawn(move || {
+            let mut queued = 0u64;
+            while queued < length {
+                let want = usize::try_from(length - queued).unwrap_or(CHUNK).min(CHUNK);
+                let Ok(mut buf) = spare.recv() else { return };
+                let read = source.read_exact(&mut buf[..want]);
+                let message = match read {
+                    Ok(()) => Ok((buf, want)),
+                    Err(err) => Err(err),
+                };
+                let failed = message.is_err();
+                if filled.send(message).is_err() || failed {
+                    return;
+                }
+                queued += want as u64;
+            }
+        });
 
-        if flush_due(done, last_flushed) {
-            push(device, offset, done, trace)?;
-            last_flushed = done;
+        let mut done = 0u64;
+        let mut last_flushed = 0u64;
+
+        for message in ready {
+            let (mut buf, want) = message.map_err(|err| Error::io("reading input file", err))?;
+            let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
+            let at = offset + done;
+
+            // Only the sector the image ends inside is read back, so the
+            // bytes past its end survive.
+            if aligned > want {
+                keep_tail(device, at, want, sector, &mut buf, trace)
+                    .map_err(|err| abort(at, done, err))?;
+            }
+
+            device.write_at(at, &buf[..aligned]).map_err(|err| {
+                trace.failed(format!("write {aligned}B at {at}"), &err);
+                abort(offset, done, err)
+            })?;
+            trace.ok(Stage::Write, format!("write {aligned}B at {at}"), "ok");
+            done += want as u64;
+            progress.advance(done, length);
+
+            if flush_due(done, last_flushed) {
+                push(device, offset, done, trace)?;
+                last_flushed = done;
+            }
+            let _ = recycled.send(buf);
         }
-    }
 
-    // What is left in the cache still has to cross to the medium, and on a slow
-    // card that is most of the wall clock. Saying so beats a report that reads
-    // as finished while the device is still working.
-    progress.waiting("waiting for the medium");
-    push(device, offset, done, trace)?;
-    progress.finish(done);
-    Ok(done)
+        // What is left in the cache still has to cross to the medium, and on a
+        // slow card that is most of the wall clock. Saying so beats a report
+        // that reads as finished while the device is still working.
+        progress.waiting("waiting for the medium");
+        push(device, offset, done, trace)?;
+        progress.finish(done);
+        Ok(done)
+    })
 }
 
-fn read_back(
+/// Restores the bytes past the end of the image inside the sector it ends in,
+/// so a length that is not a sector multiple leaves its neighbour intact. Only
+/// that one sector is read, and its start is sector aligned because `at` is.
+fn keep_tail(
     device: &mut dyn RawDevice,
     at: u64,
+    want: usize,
+    sector: u32,
     buf: &mut [u8],
     trace: &Trace,
 ) -> std::result::Result<(), DeviceError> {
-    let len = buf.len();
-    match device.read_at(at, buf) {
+    let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
+    let sector = sector as usize;
+    let tail_start = (want / sector) * sector;
+    let from = at + tail_start as u64;
+    let mut tail = vec![0u8; aligned - tail_start];
+
+    match device.read_at(from, &mut tail) {
         Ok(_) => {
             trace.ok(
                 Stage::Read,
-                format!("read-back {len}B at {at}"),
+                format!("read-back {}B at {from}", tail.len()),
                 "tail sector preserved",
             );
+            buf[want..aligned].copy_from_slice(&tail[want - tail_start..]);
             Ok(())
         }
         Err(err) => {
-            trace.failed(format!("read-back {len}B at {at}"), &err);
+            trace.failed(format!("read-back {}B at {from}", tail.len()), &err);
             Err(err)
         }
     }
@@ -383,6 +465,52 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(err.exit_code(), 5);
+    }
+
+    /// Errors from the far side of the transfer have to survive the handoff.
+    #[test]
+    fn dump_reports_a_sink_that_refuses_the_data() {
+        struct Refuses;
+        impl Write for Refuses {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
+        let err = dump(
+            &mut device,
+            0,
+            4096,
+            &mut Refuses,
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Io { .. }), "{err}");
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn flash_reports_a_source_that_ends_early() {
+        let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
+        let short = pattern(512);
+
+        let err = flash(
+            &mut device,
+            0,
+            4096,
+            &mut short.as_slice(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::Io { .. }), "{err}");
     }
 
     #[test]
