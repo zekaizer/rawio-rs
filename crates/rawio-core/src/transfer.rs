@@ -11,6 +11,19 @@ use crate::trace::Trace;
 /// Transfer granularity. Always a multiple of any plausible sector size.
 const CHUNK: usize = 1 << 20;
 
+/// How much may sit in the page cache before it is pushed at the medium.
+///
+/// Without this the whole image is absorbed at memory speed and the single
+/// flush at the end blocks for as long as the card needs, so the progress
+/// report races to 100% and then appears to hang. Flushing as we go costs
+/// nothing on a device that is already the bottleneck.
+pub const FLUSH_INTERVAL: u64 = 32 << 20;
+
+/// True when enough has been written since the last flush to push again.
+pub fn flush_due(done: u64, last_flushed: u64) -> bool {
+    done.saturating_sub(last_flushed) >= FLUSH_INTERVAL
+}
+
 pub fn align_up(value: u64, sector: u32) -> u64 {
     let sector = u64::from(sector);
     value.div_ceil(sector) * sector
@@ -103,6 +116,7 @@ pub fn flash(
 
     let mut buf = vec![0u8; CHUNK];
     let mut done = 0u64;
+    let mut last_flushed = 0u64;
     while done < length {
         let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
         let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
@@ -124,11 +138,18 @@ pub fn flash(
         trace.ok(Stage::Write, format!("write {aligned}B at {at}"), "ok");
         done += want as u64;
         progress.advance(done, length);
+
+        if flush_due(done, last_flushed) {
+            push(device, offset, done, trace)?;
+            last_flushed = done;
+        }
     }
-    device.flush().map_err(|err| {
-        trace.failed("flush", &err);
-        abort(offset, done, err)
-    })?;
+
+    // What is left in the cache still has to cross to the medium, and on a slow
+    // card that is most of the wall clock. Saying so beats a report that reads
+    // as finished while the device is still working.
+    progress.waiting("waiting for the medium");
+    push(device, offset, done, trace)?;
     progress.finish(done);
     Ok(done)
 }
@@ -156,6 +177,15 @@ fn read_back(
     }
 }
 
+fn push(device: &mut dyn RawDevice, start: u64, done: u64, trace: &Trace) -> Result<()> {
+    device.flush().map_err(|err| {
+        trace.failed(format!("flush after {done}B"), &err);
+        abort(start, done, err)
+    })?;
+    trace.ok(Stage::Flush, format!("flush after {done}B"), "ok");
+    Ok(())
+}
+
 fn abort(start: u64, written: u64, source: DeviceError) -> Error {
     Error::WriteAborted {
         start,
@@ -169,6 +199,61 @@ mod tests {
     use super::*;
     use crate::device::{MemoryDevice, Removability};
     use crate::progress::Silent;
+
+    /// Records the order the transfer reported things in.
+    #[derive(Default)]
+    struct Recorder {
+        events: Vec<String>,
+    }
+
+    impl Progress for Recorder {
+        fn advance(&mut self, done: u64, total: u64) {
+            self.events.push(format!("advance {done}/{total}"));
+        }
+
+        fn waiting(&mut self, what: &str) {
+            self.events.push(format!("waiting {what}"));
+        }
+
+        fn finish(&mut self, done: u64) {
+            self.events.push(format!("finish {done}"));
+        }
+    }
+
+    #[test]
+    fn the_flush_interval_is_measured_from_the_last_flush() {
+        assert!(!flush_due(0, 0));
+        assert!(!flush_due(FLUSH_INTERVAL - 1, 0));
+        assert!(flush_due(FLUSH_INTERVAL, 0));
+        assert!(!flush_due(FLUSH_INTERVAL + 1, FLUSH_INTERVAL));
+        assert!(flush_due(2 * FLUSH_INTERVAL, FLUSH_INTERVAL));
+    }
+
+    /// The page cache takes the write long before the medium does, so the
+    /// report has to say it is still waiting rather than claim it is done.
+    #[test]
+    fn flash_reports_the_wait_for_the_medium_before_it_finishes() {
+        let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
+        let mut recorder = Recorder::default();
+
+        flash(
+            &mut device,
+            0,
+            2048,
+            &mut pattern(2048).as_slice(),
+            &Trace::new(),
+            &mut recorder,
+        )
+        .unwrap();
+
+        let waiting = recorder
+            .events
+            .iter()
+            .position(|e| e.starts_with("waiting"));
+        let finish = recorder.events.iter().position(|e| e.starts_with("finish"));
+        assert!(waiting.is_some(), "{:?}", recorder.events);
+        assert!(waiting < finish, "{:?}", recorder.events);
+    }
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()

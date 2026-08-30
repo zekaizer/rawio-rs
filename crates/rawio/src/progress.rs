@@ -62,6 +62,8 @@ pub struct Bar {
     started: Instant,
     last_drawn: Instant,
     width: usize,
+    /// Last reported position, so a wait can redraw the line it interrupts.
+    at: (u64, u64),
 }
 
 impl Bar {
@@ -78,6 +80,7 @@ impl Bar {
             started: now,
             last_drawn: now - MIN_INTERVAL,
             width: 0,
+            at: (0, 0),
         }
     }
 
@@ -92,12 +95,19 @@ impl Bar {
 
 impl Progress for Bar {
     fn advance(&mut self, done: u64, total: u64) {
+        self.at = (done, total);
         if self.last_drawn.elapsed() < MIN_INTERVAL {
             return;
         }
         self.last_drawn = Instant::now();
         let line = progress_line(self.label, done, total, self.started.elapsed());
         self.draw(&line);
+    }
+
+    fn waiting(&mut self, what: &str) {
+        let (done, total) = self.at;
+        let line = progress_line(self.label, done, total, self.started.elapsed());
+        self.draw(&format!("{line}  {what}"));
     }
 
     fn finish(&mut self, done: u64) {
