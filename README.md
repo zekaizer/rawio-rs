@@ -22,7 +22,10 @@ rather than rounded. A write whose length is not a multiple of the sector size
 reads the final sector back first, so the bytes after the image survive.
 
 `--dry-run` resolves the target, prints what would happen, and stops without
-reading or writing the device.
+reading or writing the device. It is offered by `dump`, `flash` and `verify`
+and by nothing else; the same goes for `--no-progress`, and `--pit-offset` is
+offered only by the commands that can read a table. `--trace` is the one option
+every command takes.
 
 A progress line is drawn on stderr while a transfer runs, and only when stderr
 is a terminal, so a piped or redirected run stays quiet on its own. `--no-progress`

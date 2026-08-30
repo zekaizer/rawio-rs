@@ -4,7 +4,10 @@
 use std::fs::File;
 use std::io::{Read, Write};
 
-use crate::cli::{Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, ProbeArgs, VerifyArgs};
+use crate::cli::{
+    Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, PitSource, ProbeArgs, TransferOptions,
+    VerifyArgs,
+};
 use crate::longpath;
 use crate::progress::{Bar, human_size};
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
@@ -23,6 +26,24 @@ struct Options {
 }
 
 impl Options {
+    /// A command that moves bytes: it can be rehearsed and it can report.
+    fn transfer(pit: &PitSource, transfer: &TransferOptions) -> Self {
+        Self {
+            pit_at: pit.pit_offset,
+            dry_run: transfer.dry_run,
+            progress: Bar::enabled(transfer.no_progress),
+        }
+    }
+
+    /// A command that only looks: neither rehearsal nor progress applies.
+    fn inspect(pit: &PitSource) -> Self {
+        Self {
+            pit_at: pit.pit_offset,
+            dry_run: false,
+            progress: false,
+        }
+    }
+
     fn bar(&self, label: &'static str) -> Box<dyn Progress> {
         if self.progress {
             Box::new(Bar::new(label))
@@ -47,18 +68,34 @@ pub struct Range {
 }
 
 pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
-    let opts = Options {
-        pit_at: cli.pit_offset,
-        dry_run: cli.dry_run,
-        progress: Bar::enabled(cli.no_progress),
-    };
     match &cli.command {
         Command::List => list(backend, out, trace),
-        Command::Probe(args) => probe(args, backend, out, trace, &opts),
-        Command::Pit(args) => pit(args, backend, out, trace, &opts),
-        Command::Dump(args) => dump(args, backend, out, trace, &opts),
-        Command::Flash(args) => flash(args, backend, out, trace, &opts),
-        Command::Verify(args) => verify(args, backend, out, trace, &opts),
+        Command::Probe(args) => probe(
+            args,
+            backend,
+            out,
+            trace,
+            &Options::inspect(&args.pit_source),
+        ),
+        Command::Pit(args) => pit(
+            args,
+            backend,
+            out,
+            trace,
+            &Options::inspect(&args.pit_source),
+        ),
+        Command::Dump(args) => {
+            let opts = Options::transfer(&args.pit_source, &args.transfer);
+            dump(args, backend, out, trace, &opts)
+        }
+        Command::Flash(args) => {
+            let opts = Options::transfer(&args.pit_source, &args.transfer);
+            flash(args, backend, out, trace, &opts)
+        }
+        Command::Verify(args) => {
+            let opts = Options::transfer(&args.pit_source, &args.transfer);
+            verify(args, backend, out, trace, &opts)
+        }
     }
 }
 
