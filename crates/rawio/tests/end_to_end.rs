@@ -424,6 +424,72 @@ fn a_dry_run_flash_leaves_the_device_untouched() {
 }
 
 #[test]
+fn flash_can_read_back_what_it_wrote() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("verifyok").join("img.bin");
+    std::fs::write(
+        &input,
+        (0..4096).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+            "--verify",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("verified"), "{out}");
+}
+
+#[test]
+fn verify_names_the_first_byte_that_differs() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("verifybad").join("img.bin");
+    std::fs::write(&input, vec![0x11; 4096]).unwrap();
+
+    let (flashed, _) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+    assert!(flashed.is_ok(), "{flashed:?}");
+    backend.device.borrow_mut().contents_mut()[4096 + 100] = 0x22;
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("4196"), "{message}");
+}
+
+#[test]
 fn a_length_larger_than_the_partition_is_rejected() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 0, &[("LOG", 64, 128)]);

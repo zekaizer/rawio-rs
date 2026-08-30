@@ -2,9 +2,9 @@
 //! driven by a fake device in tests.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 
-use crate::cli::{Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, ProbeArgs};
+use crate::cli::{Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, ProbeArgs, VerifyArgs};
 use crate::longpath;
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
 use rawio_core::error::{Error, Result, Stage};
@@ -44,6 +44,7 @@ pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace)
         Command::Pit(args) => pit(args, backend, out, trace, &opts),
         Command::Dump(args) => dump(args, backend, out, trace, &opts),
         Command::Flash(args) => flash(args, backend, out, trace, &opts),
+        Command::Verify(args) => verify(args, backend, out, trace, &opts),
     }
 }
 
@@ -194,9 +195,88 @@ fn flash(
     }
     .map_err(|e| Error::io("writing output", e))?;
 
+    if args.verify {
+        compare(&mut *device, range.offset, written, &input, out, trace)?;
+    }
     Ok(())
 }
 
+/// Reads the range back and compares it with the file it came from.
+fn verify(
+    args: &VerifyArgs,
+    backend: &dyn Backend,
+    out: &mut dyn Write,
+    trace: &Trace,
+    opts: &Options,
+) -> Result<()> {
+    let input = longpath::for_open(&args.input);
+    let length = std::fs::metadata(&input)
+        .map_err(|e| Error::io(format!("stat {input:?}"), e))?
+        .len();
+
+    let mut device = backend.open(&args.device, Access::Read, trace)?;
+    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
+        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+
+    if opts.dry_run {
+        return writeln!(
+            out,
+            "dry-run: would compare {length} bytes of {} at {}..{} against {input:?}",
+            args.device,
+            range.offset,
+            range.offset + length,
+        )
+        .map_err(|e| Error::io("writing output", e));
+    }
+
+    compare(&mut *device, range.offset, length, &input, out, trace)
+}
+
+fn compare(
+    device: &mut dyn RawDevice,
+    offset: u64,
+    length: u64,
+    source: &std::path::Path,
+    out: &mut dyn Write,
+    trace: &Trace,
+) -> Result<()> {
+    const CHUNK: usize = 1 << 20;
+    let sector = device.info().logical_sector_size;
+    let mut file = File::open(source).map_err(|e| Error::io(format!("opening {source:?}"), e))?;
+    let mut from_device = vec![0u8; CHUNK];
+    let mut from_file = vec![0u8; CHUNK];
+
+    let mut done = 0u64;
+    while done < length {
+        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
+        let aligned = usize::try_from(transfer::align_up(want as u64, sector)).unwrap_or(want);
+        let at = offset + done;
+
+        device
+            .read_at(at, &mut from_device[..aligned])
+            .map_err(|err| {
+                trace.failed(format!("verify read {aligned}B at {at}"), &err);
+                Error::Device(err)
+            })?;
+        file.read_exact(&mut from_file[..want])
+            .map_err(|e| Error::io("reading input file", e))?;
+
+        if let Some(i) = (0..want).position(|i| from_device[i] != from_file[i]) {
+            return Err(Error::VerifyFailed {
+                offset: at + i as u64,
+                expected: from_file[i],
+                found: from_device[i],
+            });
+        }
+        done += want as u64;
+    }
+
+    writeln!(out, "verified {done} bytes at offset {offset}")
+        .map_err(|e| Error::io("writing output", e))
+}
+
+/// The PIT is read only when `--partition` was given, and the range it resolves
+/// to is printed, and checked against the device, before it is used.
 fn resolve(
     device: &mut dyn RawDevice,
     location: &Location,

@@ -20,7 +20,7 @@ pub struct Cli {
     pub pit_offset: u64,
 
     /// Resolve the target and report what would happen, without reading or
-    /// writing the device. Applies to dump and flash.
+    /// writing the device. Applies to dump, flash and verify.
     #[arg(long, global = true)]
     pub dry_run: bool,
 
@@ -40,6 +40,8 @@ pub enum Command {
     Dump(DumpArgs),
     /// Write a file into a raw range on the device.
     Flash(FlashArgs),
+    /// Compare a raw range on the device against a file.
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +85,22 @@ pub struct FlashArgs {
     pub location: Location,
 
     /// Source file. Its length is the write length.
+    #[arg(long, short = 'i')]
+    pub input: std::path::PathBuf,
+
+    /// Read the range back after writing and compare it with the input.
+    #[arg(long)]
+    pub verify: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    pub device: String,
+
+    #[command(flatten)]
+    pub location: Location,
+
+    /// File the range is compared against. Its length is the compared length.
     #[arg(long, short = 'i')]
     pub input: std::path::PathBuf,
 }

@@ -12,7 +12,8 @@ rawio list                                  # enumerate candidate devices
 rawio probe  <device> [--pit]               # non-destructive pre-flight report
 rawio pit    <device>                       # print the PIT partition table
 rawio dump   <device> <target> --length N --output FILE
-rawio flash  <device> <target> --input FILE
+rawio flash  <device> <target> --input FILE [--verify]
+rawio verify <device> <target> --input FILE
 ```
 
 `--offset` / `--length` accept decimal, `0x` hex, and `K`/`M`/`G` suffixes. An
@@ -99,3 +100,4 @@ runs on any x86_64 machine without a matching glibc.
 | 4 | refused: target is not removable |
 | 5 | write aborted; last successfully written offset is reported |
 | 6 | unsupported on this platform |
+| 7 | verification failed; the offset of the first differing byte is reported |
