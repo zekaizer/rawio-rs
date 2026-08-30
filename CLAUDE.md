@@ -30,5 +30,8 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - No interactive prompts, ever. Every failure exits non-zero with the stage and
   the raw OS error code.
 - `flash` has no removable-check override. Do not add one.
-- The PIT layout is reverse engineered, not specified. Keep it opt-in, keep
-  printing the resolved range before using it, and abort on any parse failure.
+- The PIT layout is reverse engineered, not specified. Two sources agree on it
+  (an XDA analysis and github.com/CruelKernel/samsung_pit), but no real card has
+  been parsed yet. Keep it opt-in, keep printing the header and the resolved
+  range before using it, and abort on any parse failure. The 512B block size is
+  still an assumption.

@@ -137,10 +137,21 @@ fn resolve(
         };
         writeln!(
             out,
-            "pit: {} -> offset={} length={} (block_offset={} block_count={}, assumed block size {})",
+            "pit: chip={:?} port={:?} format={:?} entries={}",
+            pit.chip,
+            pit.port,
+            pit.format,
+            pit.partitions.len(),
+        )
+        .map_err(|e| Error::io("writing output", e))?;
+        writeln!(
+            out,
+            "pit: {} -> offset={} length={} (device_type={} block_offset={} block_count={}, \
+             assumed block size {})",
             partition.name,
             range.offset,
             partition.byte_length(),
+            partition.device_type,
             partition.block_offset,
             partition.block_count,
             rawio_core::pit::ASSUMED_BLOCK_SIZE,
