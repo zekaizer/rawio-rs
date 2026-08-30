@@ -112,8 +112,11 @@ pub fn parse_size(value: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
     use clap::CommandFactory;
+
+    use super::*;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -151,6 +154,41 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// The WSL shares, the extended-length and device namespaces, and plain UNC
+    /// all reach the OS exactly as typed. Rewriting them breaks paths that
+    /// Windows accepts and we do not.
+    #[test]
+    fn special_paths_are_not_rewritten() {
+        let paths = [
+            r"\\wsl.localhost\Ubuntu-24.04\home\me\boot.bin",
+            r"\\wsl$\Ubuntu\home\me\boot.bin",
+            r"\\?\C:\images\boot.bin",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\me\boot.bin",
+            r"\\server\share\boot.bin",
+            r"C:\images\boot.bin",
+            "C:/images/boot.bin",
+            "/home/me/boot.bin",
+        ];
+
+        for given in paths {
+            let cli = Cli::try_parse_from([
+                "rawio", "dump", "dev", "--offset", "0", "--length", "512", "-o", given,
+            ])
+            .unwrap();
+            let Command::Dump(args) = cli.command else {
+                panic!("expected dump")
+            };
+            assert_eq!(args.output, PathBuf::from(given), "{given}");
+
+            let cli = Cli::try_parse_from(["rawio", "flash", "dev", "--offset", "0", "-i", given])
+                .unwrap();
+            let Command::Flash(args) = cli.command else {
+                panic!("expected flash")
+            };
+            assert_eq!(args.input, PathBuf::from(given), "{given}");
+        }
     }
 
     /// There must be no way to ask for the removable check to be skipped.

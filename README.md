@@ -22,6 +22,21 @@ reads the final sector back first, so the bytes after the image survive.
 Target selection by PIT partition name is opt-in (`--partition NAME`) and always
 prints the resolved offset and length before touching the device.
 
+## File paths
+
+`--input` / `--output` are handed to the OS exactly as typed. On Windows that
+means the special path forms all work as they do in any other program:
+
+```
+\\wsl.localhost\Ubuntu-24.04\home\me\boot.bin   file inside a WSL distribution
+\\wsl$\Ubuntu\home\me\boot.bin                  the older WSL share name
+\\?\C:\...                                      extended-length path
+\\server\share\boot.bin                         plain UNC
+```
+
+Reaching a file inside WSL needs that distribution to be running; if it is not,
+the failure is reported with the raw Windows error code.
+
 ## Safety
 
 `flash` refuses any device that is not reported as removable. There is no
