@@ -24,6 +24,15 @@ reads the final sector back first, so the bytes after the image survive.
 `--dry-run` resolves the target, prints what would happen, and stops without
 reading or writing the device.
 
+A progress line is drawn on stderr while a transfer runs, and only when stderr
+is a terminal, so a piped or redirected run stays quiet on its own. `--no-progress`
+turns it off everywhere. Results go to stdout, so a script can read them with
+the progress line still on screen.
+
+```
+flash 32.0 MiB / 512.0 MiB    6%  16.0 MiB/s  30s
+```
+
 ## Targeting
 
 A target is one of `--offset N`, `--partition NAME`, or `--partition-id N`; they

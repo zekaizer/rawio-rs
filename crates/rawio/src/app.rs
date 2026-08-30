@@ -6,9 +6,11 @@ use std::io::{Read, Write};
 
 use crate::cli::{Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, ProbeArgs, VerifyArgs};
 use crate::longpath;
+use crate::progress::{Bar, human_size};
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
 use rawio_core::error::{Error, Result, Stage};
 use rawio_core::pit::{ASSUMED_BLOCK_SIZE, Pit};
+use rawio_core::progress::{Progress, Silent};
 use rawio_core::trace::Trace;
 use rawio_core::transfer;
 
@@ -17,6 +19,17 @@ use rawio_core::transfer;
 struct Options {
     pit_at: u64,
     dry_run: bool,
+    progress: bool,
+}
+
+impl Options {
+    fn bar(&self, label: &'static str) -> Box<dyn Progress> {
+        if self.progress {
+            Box::new(Bar::new(label))
+        } else {
+            Box::new(Silent)
+        }
+    }
 }
 
 /// How the caller named the partition it wants.
@@ -37,6 +50,7 @@ pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace)
     let opts = Options {
         pit_at: cli.pit_offset,
         dry_run: cli.dry_run,
+        progress: Bar::enabled(cli.no_progress),
     };
     match &cli.command {
         Command::List => list(backend, out, trace),
@@ -137,7 +151,15 @@ fn dump(
 
     let mut file =
         File::create(&output).map_err(|e| Error::io(format!("creating {output:?}"), e))?;
-    let written = transfer::dump(&mut *device, range.offset, length, &mut file, trace)?;
+    let mut bar = opts.bar("dump");
+    let written = transfer::dump(
+        &mut *device,
+        range.offset,
+        length,
+        &mut file,
+        trace,
+        bar.as_mut(),
+    )?;
     writeln!(
         out,
         "dumped {written} bytes from offset {} to {output:?}",
@@ -184,7 +206,15 @@ fn flash(
         .map_err(|e| Error::io("writing output", e));
     }
 
-    let written = transfer::flash(&mut *device, range.offset, input_len, &mut file, trace)?;
+    let mut bar = opts.bar("flash");
+    let written = transfer::flash(
+        &mut *device,
+        range.offset,
+        input_len,
+        &mut file,
+        trace,
+        bar.as_mut(),
+    )?;
     match range.length {
         Some(capacity) => writeln!(
             out,
@@ -196,7 +226,15 @@ fn flash(
     .map_err(|e| Error::io("writing output", e))?;
 
     if args.verify {
-        compare(&mut *device, range.offset, written, &input, out, trace)?;
+        compare(
+            &mut *device,
+            range.offset,
+            written,
+            &input,
+            out,
+            trace,
+            opts,
+        )?;
     }
     Ok(())
 }
@@ -229,7 +267,7 @@ fn verify(
         .map_err(|e| Error::io("writing output", e));
     }
 
-    compare(&mut *device, range.offset, length, &input, out, trace)
+    compare(&mut *device, range.offset, length, &input, out, trace, opts)
 }
 
 fn compare(
@@ -239,8 +277,10 @@ fn compare(
     source: &std::path::Path,
     out: &mut dyn Write,
     trace: &Trace,
+    opts: &Options,
 ) -> Result<()> {
     const CHUNK: usize = 1 << 20;
+    let mut bar = opts.bar("verify");
     let sector = device.info().logical_sector_size;
     let mut file = File::open(source).map_err(|e| Error::io(format!("opening {source:?}"), e))?;
     let mut from_device = vec![0u8; CHUNK];
@@ -269,7 +309,9 @@ fn compare(
             });
         }
         done += want as u64;
+        bar.advance(done, length);
     }
+    bar.finish(done);
 
     writeln!(out, "verified {done} bytes at offset {offset}")
         .map_err(|e| Error::io("writing output", e))
@@ -424,23 +466,6 @@ fn read_pit(device: &mut dyn RawDevice, at: u64, trace: &Trace) -> Result<Pit> {
         )),
         other => other,
     })
-}
-
-/// Byte counts are what the tool acts on; this column is only so a wrong parse
-/// looks wrong at a glance.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 4] = [
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-        ("B", 1),
-    ];
-    for (unit, scale) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
-        }
-    }
-    "0 B".to_string()
 }
 
 fn describe(info: &DeviceInfo) -> String {

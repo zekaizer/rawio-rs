@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 
 use crate::device::{DeviceInfo, RawDevice};
 use crate::error::{DeviceError, Error, Result, Stage};
+use crate::progress::Progress;
 use crate::trace::Trace;
 
 /// Transfer granularity. Always a multiple of any plausible sector size.
@@ -57,6 +58,7 @@ pub fn dump(
     length: u64,
     sink: &mut dyn Write,
     trace: &Trace,
+    progress: &mut dyn Progress,
 ) -> Result<u64> {
     let sector = device.info().logical_sector_size;
     require_aligned("offset", offset, sector)?;
@@ -77,9 +79,11 @@ pub fn dump(
         sink.write_all(&chunk[..want])
             .map_err(|err| Error::io("writing output file", err))?;
         done += want as u64;
+        progress.advance(done, length);
     }
     sink.flush()
         .map_err(|err| Error::io("flushing output file", err))?;
+    progress.finish(done);
     Ok(done)
 }
 
@@ -90,6 +94,7 @@ pub fn flash(
     length: u64,
     source: &mut dyn Read,
     trace: &Trace,
+    progress: &mut dyn Progress,
 ) -> Result<u64> {
     ensure_writable(device.info())?;
     let sector = device.info().logical_sector_size;
@@ -118,11 +123,13 @@ pub fn flash(
         })?;
         trace.ok(Stage::Write, format!("write {aligned}B at {at}"), "ok");
         done += want as u64;
+        progress.advance(done, length);
     }
     device.flush().map_err(|err| {
         trace.failed("flush", &err);
         abort(offset, done, err)
     })?;
+    progress.finish(done);
     Ok(done)
 }
 
@@ -161,6 +168,7 @@ fn abort(start: u64, written: u64, source: DeviceError) -> Error {
 mod tests {
     use super::*;
     use crate::device::{MemoryDevice, Removability};
+    use crate::progress::Silent;
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
@@ -173,7 +181,7 @@ mod tests {
         device.contents_mut()[512..1536].copy_from_slice(&data);
 
         let mut out = Vec::new();
-        let n = dump(&mut device, 512, 1024, &mut out, &Trace::new()).unwrap();
+        let n = dump(&mut device, 512, 1024, &mut out, &Trace::new(), &mut Silent).unwrap();
 
         assert_eq!(n, 1024);
         assert_eq!(out, data);
@@ -184,9 +192,25 @@ mod tests {
         let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
         let data = pattern(2048);
 
-        flash(&mut device, 1024, 2048, &mut data.as_slice(), &Trace::new()).unwrap();
+        flash(
+            &mut device,
+            1024,
+            2048,
+            &mut data.as_slice(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap();
         let mut out = Vec::new();
-        dump(&mut device, 1024, 2048, &mut out, &Trace::new()).unwrap();
+        dump(
+            &mut device,
+            1024,
+            2048,
+            &mut out,
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap();
 
         assert_eq!(out, data);
     }
@@ -202,6 +226,7 @@ mod tests {
             600,
             &mut pattern(600).as_slice(),
             &Trace::new(),
+            &mut Silent,
         )
         .unwrap();
 
@@ -218,6 +243,7 @@ mod tests {
             512,
             &mut pattern(512).as_slice(),
             &Trace::new(),
+            &mut Silent,
         )
         .unwrap_err();
 
@@ -235,6 +261,7 @@ mod tests {
             4096,
             &mut pattern(4096).as_slice(),
             &Trace::new(),
+            &mut Silent,
         )
         .unwrap_err();
 
@@ -248,7 +275,15 @@ mod tests {
         device.fail_writes_from(1 << 20);
         let data = pattern(2 << 20);
 
-        let err = flash(&mut device, 0, 2 << 20, &mut data.as_slice(), &Trace::new()).unwrap_err();
+        let err = flash(
+            &mut device,
+            0,
+            2 << 20,
+            &mut data.as_slice(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
 
         match err {
             Error::WriteAborted {
@@ -268,7 +303,15 @@ mod tests {
     #[test]
     fn unaligned_offset_is_rejected() {
         let mut device = MemoryDevice::new("mem0", 4096, Removability::Removable);
-        let err = dump(&mut device, 100, 512, &mut Vec::new(), &Trace::new()).unwrap_err();
+        let err = dump(
+            &mut device,
+            100,
+            512,
+            &mut Vec::new(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, Error::InvalidArgument(_)));
     }

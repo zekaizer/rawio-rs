@@ -24,6 +24,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub dry_run: bool,
 
+    /// Do not draw the progress line. It is drawn only when stderr is a
+    /// terminal, so a piped or redirected run is already quiet.
+    #[arg(long, global = true)]
+    pub no_progress: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
