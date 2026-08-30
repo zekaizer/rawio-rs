@@ -25,11 +25,16 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
-    fn enumerate(&self) -> Result<Vec<DeviceInfo>, DeviceError> {
+    fn enumerate(&self, _trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
         Ok(vec![self.device.borrow().info().clone()])
     }
 
-    fn open(&self, id: &str, _access: Access) -> Result<Box<dyn RawDevice>, DeviceError> {
+    fn open(
+        &self,
+        id: &str,
+        _access: Access,
+        _trace: &Trace,
+    ) -> Result<Box<dyn RawDevice>, DeviceError> {
         if id != "mem0" {
             return Err(DeviceError::new(
                 Stage::Open,

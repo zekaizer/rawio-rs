@@ -17,6 +17,95 @@ pub const BUS_TYPE_USB: u32 = 0x07;
 pub const BUS_TYPE_SD: u32 = 0x0C;
 pub const BUS_TYPE_MMC: u32 = 0x0D;
 
+/// Control codes, spelled out rather than pulled from a binding so the values
+/// are visible next to the buffer layouts they go with.
+pub const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
+pub const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+pub const IOCTL_DISK_GET_DRIVE_GEOMETRY: u32 = 0x0007_0000;
+pub const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+pub const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+
+/// `STORAGE_PROPERTY_QUERY { StorageDeviceProperty, PropertyStandardQuery }`.
+pub const STORAGE_DEVICE_PROPERTY_QUERY: [u8; 12] = [0; 12];
+
+/// What `IOCTL_STORAGE_QUERY_PROPERTY` reports about a disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDescriptor {
+    pub removable_media: bool,
+    pub bus_type: u32,
+    pub vendor: String,
+    pub product: String,
+}
+
+/// `STORAGE_DEVICE_DESCRIPTOR`: removable flag at 10, id offsets at 12 and 16,
+/// bus type at 28. The id offsets are relative to the start of the buffer and
+/// are zero when the field is absent.
+pub fn parse_device_descriptor(buf: &[u8]) -> Option<DeviceDescriptor> {
+    const HEADER: usize = 36;
+    if buf.len() < HEADER {
+        return None;
+    }
+    Some(DeviceDescriptor {
+        removable_media: buf[10] != 0,
+        bus_type: u32_at(buf, 28)?,
+        vendor: ascii_at(buf, u32_at(buf, 12)? as usize),
+        product: ascii_at(buf, u32_at(buf, 16)? as usize),
+    })
+}
+
+/// `VOLUME_DISK_EXTENTS`: extent count at 0, then 24B extents from offset 8,
+/// each starting with the physical disk number.
+pub fn parse_disk_extents(buf: &[u8]) -> Vec<u32> {
+    const EXTENT: usize = 24;
+    const FIRST: usize = 8;
+
+    let Some(count) = u32_at(buf, 0) else {
+        return Vec::new();
+    };
+    (0..count as usize)
+        .map_while(|i| {
+            let at = FIRST + i * EXTENT;
+            // A partial extent at the end is not a disk number, it is a short read.
+            (buf.len() >= at + EXTENT)
+                .then(|| u32_at(buf, at))
+                .flatten()
+        })
+        .collect()
+}
+
+/// `DISK_GEOMETRY`: `BytesPerSector` is the last of six fields, at offset 20.
+pub fn parse_bytes_per_sector(buf: &[u8]) -> Option<u32> {
+    if buf.len() < 24 {
+        return None;
+    }
+    u32_at(buf, 20).filter(|size| *size != 0)
+}
+
+/// Volumes are reached by drive letter. A volume with no letter is not mounted
+/// by a filesystem either, so it cannot be the one blocking a write.
+pub fn volume_path(letter: char) -> String {
+    format!(r"\\.\{}:", letter.to_ascii_uppercase())
+}
+
+fn u32_at(buf: &[u8], at: usize) -> Option<u32> {
+    let bytes = buf.get(at..at + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+}
+
+/// NUL terminated ASCII at a buffer relative offset. Offset zero means the
+/// field is absent.
+fn ascii_at(buf: &[u8], at: usize) -> String {
+    if at == 0 || at >= buf.len() {
+        return String::new();
+    }
+    let rest = &buf[at..];
+    let end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).trim().to_string()
+}
+
 pub fn physical_drive_path(index: u32) -> String {
     format!(r"\\.\PhysicalDrive{index}")
 }
@@ -100,6 +189,81 @@ mod tests {
     fn a_fixed_non_card_disk_is_never_writable() {
         assert_eq!(classify(false, 0x03), Removability::Fixed);
         assert!(!classify(false, 0x03).writable());
+    }
+
+    fn descriptor(removable: bool, bus: u32, vendor: &str, product: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 36 + vendor.len() + product.len() + 2];
+        buf[10] = u8::from(removable);
+        buf[12..16].copy_from_slice(&36u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(36 + vendor.len() as u32 + 1).to_le_bytes());
+        buf[28..32].copy_from_slice(&bus.to_le_bytes());
+        buf[36..36 + vendor.len()].copy_from_slice(vendor.as_bytes());
+        let at = 36 + vendor.len() + 1;
+        buf[at..at + product.len()].copy_from_slice(product.as_bytes());
+        let size = buf.len() as u32;
+        buf[4..8].copy_from_slice(&size.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn a_descriptor_yields_the_removable_flag_bus_and_names() {
+        let parsed =
+            parse_device_descriptor(&descriptor(true, BUS_TYPE_SD, "Generic ", "SD/MMC")).unwrap();
+
+        assert!(parsed.removable_media);
+        assert_eq!(parsed.bus_type, BUS_TYPE_SD);
+        assert_eq!(parsed.vendor, "Generic");
+        assert_eq!(parsed.product, "SD/MMC");
+    }
+
+    #[test]
+    fn a_descriptor_with_no_id_offsets_still_parses() {
+        let mut buf = vec![0u8; 36];
+        buf[4..8].copy_from_slice(&36u32.to_le_bytes());
+        buf[28..32].copy_from_slice(&BUS_TYPE_USB.to_le_bytes());
+        let parsed = parse_device_descriptor(&buf).unwrap();
+
+        assert!(!parsed.removable_media);
+        assert_eq!(parsed.vendor, "");
+        assert_eq!(parsed.product, "");
+    }
+
+    #[test]
+    fn a_truncated_descriptor_is_rejected() {
+        assert_eq!(parse_device_descriptor(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn disk_extents_list_every_physical_disk_a_volume_spans() {
+        let mut buf = vec![0u8; 8 + 24 * 2];
+        buf[0..4].copy_from_slice(&2u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&2u32.to_le_bytes());
+        buf[32..36].copy_from_slice(&5u32.to_le_bytes());
+
+        assert_eq!(parse_disk_extents(&buf), vec![2, 5]);
+    }
+
+    #[test]
+    fn a_short_extent_buffer_yields_nothing() {
+        assert!(parse_disk_extents(&[0u8; 4]).is_empty());
+        let mut truncated = vec![0u8; 8 + 12];
+        truncated[0..4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(parse_disk_extents(&truncated).is_empty());
+    }
+
+    #[test]
+    fn geometry_reports_the_logical_sector_size() {
+        let mut buf = vec![0u8; 24];
+        buf[20..24].copy_from_slice(&4096u32.to_le_bytes());
+
+        assert_eq!(parse_bytes_per_sector(&buf), Some(4096));
+        assert_eq!(parse_bytes_per_sector(&[0u8; 24]), None);
+        assert_eq!(parse_bytes_per_sector(&[0u8; 8]), None);
+    }
+
+    #[test]
+    fn volumes_are_addressed_by_drive_letter() {
+        assert_eq!(volume_path('E'), r"\\.\E:");
     }
 
     #[test]

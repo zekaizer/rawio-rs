@@ -3,6 +3,7 @@
 
 use crate::device::{Access, Backend, DeviceInfo, RawDevice, Removability};
 use crate::error::{DeviceError, Stage};
+use crate::trace::Trace;
 
 const SYSFS_BLOCK: &str = "/sys/block";
 
@@ -20,7 +21,8 @@ impl LinuxBackend {
 }
 
 impl Backend for LinuxBackend {
-    fn enumerate(&self) -> Result<Vec<DeviceInfo>, DeviceError> {
+    fn enumerate(&self, trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
+        trace.ok(Stage::Enumerate, SYSFS_BLOCK, "scanning");
         let entries = std::fs::read_dir(SYSFS_BLOCK)
             .map_err(|err| DeviceError::from_io(Stage::Enumerate, &err))?;
 
@@ -36,9 +38,18 @@ impl Backend for LinuxBackend {
         Ok(devices)
     }
 
-    fn open(&self, id: &str, access: Access) -> Result<Box<dyn RawDevice>, DeviceError> {
+    fn open(
+        &self,
+        id: &str,
+        access: Access,
+        trace: &Trace,
+    ) -> Result<Box<dyn RawDevice>, DeviceError> {
         let name = device_name(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
-        open_device(&name, access)
+        let device = open_device(&name, access).inspect_err(|err| {
+            trace.failed(format!("/dev/{name}"), err);
+        })?;
+        trace.ok(Stage::Open, format!("/dev/{name}"), "handle acquired");
+        Ok(device)
     }
 }
 
