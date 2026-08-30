@@ -21,17 +21,14 @@ impl WindowsBackend {
 
 impl Backend for WindowsBackend {
     fn enumerate(&self, trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
-        let _ = trace;
         #[cfg(windows)]
         {
-            sys::enumerate()
+            sys::enumerate(trace)
         }
         #[cfg(not(windows))]
         {
-            Err(DeviceError::new(
-                Stage::Enumerate,
-                "Windows backend requires a Windows host",
-            ))
+            let _ = trace;
+            Err(host_required(Stage::Enumerate))
         }
     }
 
@@ -41,20 +38,21 @@ impl Backend for WindowsBackend {
         access: Access,
         trace: &Trace,
     ) -> Result<Box<dyn RawDevice>, DeviceError> {
-        let _ = trace;
         let index =
             logic::parse_device_id(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
         #[cfg(windows)]
         {
-            sys::open(index, access)
+            sys::open(index, access, trace)
         }
         #[cfg(not(windows))]
         {
-            let _ = (index, access);
-            Err(DeviceError::new(
-                Stage::Open,
-                "Windows backend requires a Windows host",
-            ))
+            let _ = (index, access, trace);
+            Err(host_required(Stage::Open))
         }
     }
+}
+
+#[cfg(not(windows))]
+fn host_required(stage: Stage) -> DeviceError {
+    DeviceError::new(stage, "the Windows backend requires a Windows host")
 }
