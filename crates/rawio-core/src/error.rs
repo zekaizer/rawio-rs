@@ -122,6 +122,14 @@ pub enum Error {
         source: DeviceError,
     },
 
+    /// The medium did not keep what was written to it.
+    #[error("verify failed at offset {offset}: expected {expected:#04x}, found {found:#04x}")]
+    VerifyFailed {
+        offset: u64,
+        expected: u8,
+        found: u8,
+    },
+
     #[error("not supported on this platform: {0}")]
     Unsupported(&'static str),
 
@@ -148,6 +156,7 @@ impl Error {
             Error::NotRemovable { .. } => 4,
             Error::WriteAborted { .. } => 5,
             Error::Unsupported(_) => 6,
+            Error::VerifyFailed { .. } => 7,
         }
     }
 }
@@ -203,6 +212,14 @@ mod tests {
                 5,
             ),
             (Error::Unsupported("x"), 6),
+            (
+                Error::VerifyFailed {
+                    offset: 4196,
+                    expected: 0x11,
+                    found: 0x22,
+                },
+                7,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.exit_code(), expected, "{err}");

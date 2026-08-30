@@ -5,5 +5,6 @@ pub mod device;
 pub mod error;
 pub mod pit;
 pub mod platform;
+pub mod progress;
 pub mod trace;
 pub mod transfer;

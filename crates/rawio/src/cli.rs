@@ -14,6 +14,21 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub trace: bool,
 
+    /// Byte offset the PIT itself sits at. The format does not fix its location,
+    /// so it is an argument rather than a guess.
+    #[arg(long, value_name = "N", value_parser = parse_size, default_value_t = 0, global = true)]
+    pub pit_offset: u64,
+
+    /// Resolve the target and report what would happen, without reading or
+    /// writing the device. Applies to dump, flash and verify.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
+    /// Do not draw the progress line. It is drawn only when stderr is a
+    /// terminal, so a piped or redirected run is already quiet.
+    #[arg(long, global = true)]
+    pub no_progress: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -24,18 +39,31 @@ pub enum Command {
     List,
     /// Report everything needed to plan a transfer, without reading or writing.
     Probe(ProbeArgs),
+    /// Print the PIT partition table. Reads only.
+    Pit(PitArgs),
     /// Copy a raw range from the device into a file.
     Dump(DumpArgs),
     /// Write a file into a raw range on the device.
     Flash(FlashArgs),
+    /// Compare a raw range on the device against a file.
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ProbeArgs {
     pub device: String,
 
+    /// Also read and print the PIT partition table.
+    #[arg(long)]
+    pub pit: bool,
+
     #[command(flatten)]
     pub location: Location,
+}
+
+#[derive(Debug, Args)]
+pub struct PitArgs {
+    pub device: String,
 }
 
 #[derive(Debug, Args)]
@@ -64,6 +92,22 @@ pub struct FlashArgs {
     /// Source file. Its length is the write length.
     #[arg(long, short = 'i')]
     pub input: std::path::PathBuf,
+
+    /// Read the range back after writing and compare it with the input.
+    #[arg(long)]
+    pub verify: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    pub device: String,
+
+    #[command(flatten)]
+    pub location: Location,
+
+    /// File the range is compared against. Its length is the compared length.
+    #[arg(long, short = 'i')]
+    pub input: std::path::PathBuf,
 }
 
 /// `--partition` is opt-in and never consulted unless it is given.
@@ -75,14 +119,13 @@ pub struct Location {
     pub offset: Option<u64>,
 
     /// Resolve the range from a PIT partition name instead of --offset.
-    #[arg(long)]
+    #[arg(long, value_name = "NAME")]
     pub partition: Option<String>,
-}
 
-impl Location {
-    /// Byte offset of the PIT itself. Its location is not fixed by the format,
-    /// so it stays an argument rather than a guess.
-    pub const DEFAULT_PIT_OFFSET: u64 = 0;
+    /// Resolve the range from a PIT partition identifier, the ID column of
+    /// `rawio pit`.
+    #[arg(long, value_name = "N")]
+    pub partition_id: Option<u32>,
 }
 
 /// Accepts decimal, `0x` hex, and K/M/G (1024-based) suffixes.
@@ -137,6 +180,23 @@ mod tests {
         assert!(parse_size("-1").is_err());
         assert!(parse_size("12x").is_err());
         assert!(parse_size("18446744073709551615G").is_err());
+    }
+
+    #[test]
+    fn partition_name_and_id_are_mutually_exclusive() {
+        let err = Cli::try_parse_from([
+            "rawio",
+            "dump",
+            "d",
+            "--partition",
+            "LOG",
+            "--partition-id",
+            "1",
+            "-o",
+            "out.bin",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
