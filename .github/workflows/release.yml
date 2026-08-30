@@ -30,7 +30,7 @@ jobs:
             binary: rawio
             suffix: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -56,7 +56,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$asset"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rawio-${{ matrix.target }}
           path: ${{ env.ASSET }}
