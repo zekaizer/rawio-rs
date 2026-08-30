@@ -1,0 +1,70 @@
+name: release
+
+# Publishing a release is the trigger; workflow_dispatch is here so the build
+# can be exercised without cutting one.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: rawio.exe
+            suffix: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: rawio
+            suffix: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # A release must not carry a build nobody ran the tests on. Each target is
+      # tested by the runner that will ship it.
+      - run: cargo test --target ${{ matrix.target }} --all-targets
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      # The name has to say which build it is: these get carried between
+      # machines on a stick, away from the page they came from.
+      - name: Name the binary after the release and target
+        shell: bash
+        run: |
+          version="${{ github.event.release.tag_name || github.sha }}"
+          asset="rawio-${version}-${{ matrix.target }}${{ matrix.suffix }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$asset"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rawio-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "$ASSET" --clobber

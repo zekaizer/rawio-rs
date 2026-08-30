@@ -128,6 +128,11 @@ Cross linkers come from `brew install mingw-w64 musl-cross` on macOS; the
 linker names are set in `.cargo/config.toml`. The Linux build is static, so it
 runs on any x86_64 machine without a matching glibc.
 
+Publishing a GitHub release builds both targets on their own runner, runs the
+test suite there first, and attaches the binaries to the release. They are named
+`rawio-<tag>-<target>`, because these get carried between machines on a stick
+and the file has to say which build it is.
+
 ## Exit codes
 
 | Code | Meaning |
