@@ -35,6 +35,23 @@ pub fn align_up(value: u64, sector: u32) -> u64 {
     value.div_ceil(sector) * sector
 }
 
+/// The chunk math assumes the sector size divides `CHUNK`; any other value
+/// would overrun the transfer buffers, so the device is refused up front.
+fn require_usable_sector(info: &DeviceInfo) -> Result<()> {
+    let sector = info.logical_sector_size;
+    if sector == 0 || !sector.is_power_of_two() || sector as usize > CHUNK {
+        return Err(Error::Device(DeviceError::new(
+            Stage::QueryGeometry,
+            format!(
+                "{} reports logical sector size {sector}, which cannot chunk a \
+                 transfer (need a power of two of at most {CHUNK})",
+                info.id
+            ),
+        )));
+    }
+    Ok(())
+}
+
 pub fn require_aligned(label: &str, value: u64, sector: u32) -> Result<()> {
     if value % u64::from(sector) != 0 {
         return Err(Error::InvalidArgument(format!(
@@ -70,6 +87,23 @@ fn ensure_within_device(info: &DeviceInfo, offset: u64, length: u64) -> Result<(
     Ok(())
 }
 
+/// Everything a range operation proves before it touches the device, shared
+/// with `--dry-run` so a rehearsal approves exactly what the real run would.
+/// Returns the exclusive end of the range.
+pub fn check_range(info: &DeviceInfo, offset: u64, length: u64) -> Result<u64> {
+    require_usable_sector(info)?;
+    let sector = info.logical_sector_size;
+    require_aligned("offset", offset, sector)?;
+    let overflow =
+        || Error::InvalidArgument(format!("offset {offset} + length {length} overflows"));
+    let end = offset.checked_add(length).ok_or_else(overflow)?;
+    let aligned = length
+        .checked_next_multiple_of(u64::from(sector))
+        .ok_or_else(overflow)?;
+    ensure_within_device(info, offset, aligned)?;
+    Ok(end)
+}
+
 /// Returns the number of bytes written to `sink`.
 pub fn dump(
     device: &mut dyn RawDevice,
@@ -79,9 +113,8 @@ pub fn dump(
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
+    check_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
-    require_aligned("offset", offset, sector)?;
-    ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
     // The sink runs on its own thread so the next device read overlaps the write
     // of the chunk before it. The device stays here: `RawDevice` is not `Send`,
@@ -154,9 +187,8 @@ pub fn flash(
     progress: &mut dyn Progress,
 ) -> Result<u64> {
     ensure_writable(device.info())?;
+    check_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
-    require_aligned("offset", offset, sector)?;
-    ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
     // Mirror of dump: the source is read on its own thread so the file read of
     // the next chunk overlaps the device write of this one.
@@ -189,7 +221,21 @@ pub fn flash(
         let mut last_flushed = 0u64;
 
         for message in ready {
-            let (mut buf, want) = message.map_err(|err| Error::io("reading input file", err))?;
+            let (mut buf, want) = match message {
+                Ok(chunk) => chunk,
+                // Nothing written yet is a plain input failure; after that the
+                // card is partially written, so the cache is pushed at the
+                // medium and the error carries how much landed.
+                Err(err) if done == 0 => {
+                    return Err(Error::io("reading input file", err));
+                }
+                Err(err) => {
+                    push(device, offset, done, trace)?;
+                    let mut source = DeviceError::from_io(Stage::Read, &err);
+                    source.message = format!("reading input file: {}", source.message);
+                    return Err(abort(offset, done, source));
+                }
+            };
             let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
             let at = offset + done;
 
@@ -197,7 +243,7 @@ pub fn flash(
             // bytes past its end survive.
             if aligned > want {
                 keep_tail(device, at, want, sector, &mut buf, trace)
-                    .map_err(|err| abort(at, done, err))?;
+                    .map_err(|err| abort(offset, done, err))?;
             }
 
             device.write_at(at, &buf[..aligned]).map_err(|err| {
@@ -223,6 +269,58 @@ pub fn flash(
         progress.finish(done);
         Ok(done)
     })
+}
+
+/// Reads the range back and compares it with `source`. Returns the number of
+/// bytes that matched; the first difference aborts with its offset. Shares the
+/// transfer guards so verify accepts exactly the ranges dump and flash do.
+pub fn verify(
+    device: &mut dyn RawDevice,
+    offset: u64,
+    length: u64,
+    source: &mut dyn Read,
+    trace: &Trace,
+    progress: &mut dyn Progress,
+) -> Result<u64> {
+    check_range(device.info(), offset, length)?;
+    let sector = device.info().logical_sector_size;
+
+    let mut from_device = vec![0u8; CHUNK];
+    let mut from_file = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    while done < length {
+        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
+        let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
+        let at = offset + done;
+
+        device
+            .read_at(at, &mut from_device[..aligned])
+            .map_err(|err| {
+                trace.failed(format!("verify read {aligned}B at {at}"), &err);
+                Error::Device(err)
+            })?;
+        trace.ok(Stage::Read, format!("verify read {aligned}B at {at}"), "ok");
+        source
+            .read_exact(&mut from_file[..want])
+            .map_err(|e| Error::io("reading input file", e))?;
+
+        // Equal chunks are the common case; the byte scan runs only on the
+        // chunk that differs.
+        if from_device[..want] != from_file[..want] {
+            let i = (0..want)
+                .position(|i| from_device[i] != from_file[i])
+                .expect("the chunks differ");
+            return Err(Error::VerifyFailed {
+                offset: at + i as u64,
+                expected: from_file[i],
+                found: from_device[i],
+            });
+        }
+        done += want as u64;
+        progress.advance(done, length);
+    }
+    progress.finish(done);
+    Ok(done)
 }
 
 /// Restores the bytes past the end of the image inside the sector it ends in,
@@ -467,6 +565,33 @@ mod tests {
         assert_eq!(err.exit_code(), 5);
     }
 
+    /// `start` is where the transfer began, whichever step failed; a recovery
+    /// that reads `start + written` must not be pointed at the failing chunk.
+    #[test]
+    fn a_tail_read_back_failure_reports_the_transfer_start() {
+        let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+        device.fail_reads_from(4096 + (1 << 20));
+        let data = pattern((1 << 20) + 100);
+
+        let err = flash(
+            &mut device,
+            4096,
+            data.len() as u64,
+            &mut data.as_slice(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        match err {
+            Error::WriteAborted { start, written, .. } => {
+                assert_eq!(start, 4096);
+                assert_eq!(written, 1 << 20);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
     /// Errors from the far side of the transfer have to survive the handoff.
     #[test]
     fn dump_reports_a_sink_that_refuses_the_data() {
@@ -495,6 +620,58 @@ mod tests {
         assert_eq!(err.exit_code(), 3);
     }
 
+    /// The card holds every chunk that landed before the source died, so the
+    /// error has to say how much, and the cache has to be pushed at the medium
+    /// so that count describes the card rather than memory.
+    #[test]
+    fn a_source_failure_mid_flash_reports_and_flushes_what_landed() {
+        struct DiesAfter {
+            data: Vec<u8>,
+            served: usize,
+        }
+        impl Read for DiesAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.served >= self.data.len() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let n = buf.len().min(self.data.len() - self.served);
+                buf[..n].copy_from_slice(&self.data[self.served..self.served + n]);
+                self.served += n;
+                Ok(n)
+            }
+        }
+
+        let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+        let mut source = DiesAfter {
+            data: pattern(1 << 20),
+            served: 0,
+        };
+
+        let err = flash(
+            &mut device,
+            4096,
+            2 << 20,
+            &mut source,
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        match err {
+            Error::WriteAborted {
+                start,
+                written,
+                ref source,
+            } => {
+                assert_eq!(start, 4096);
+                assert_eq!(written, 1 << 20);
+                assert!(source.message.contains("reading input file"), "{source}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(device.flushes(), 1);
+    }
+
     #[test]
     fn flash_reports_a_source_that_ends_early() {
         let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
@@ -511,6 +688,29 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::Io { .. }), "{err}");
+    }
+
+    /// The chunk math holds only for sector sizes that divide the chunk; a
+    /// device reporting anything else must be refused, not overrun a buffer.
+    #[test]
+    fn a_sector_size_that_cannot_chunk_is_refused_not_a_panic() {
+        for sector in [0u32, 520, 4224, (CHUNK as u32) * 2] {
+            let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+            device.set_sector_size(sector);
+
+            let err = dump(
+                &mut device,
+                0,
+                2 << 20,
+                &mut Vec::new(),
+                &Trace::new(),
+                &mut Silent,
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, Error::Device(_)), "sector {sector}: {err}");
+            assert!(err.to_string().contains("sector"), "sector {sector}: {err}");
+        }
     }
 
     #[test]

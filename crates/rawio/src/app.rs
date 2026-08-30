@@ -2,7 +2,7 @@
 //! driven by a fake device in tests.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use crate::cli::{
     Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, PitSource, ProbeArgs, TransferOptions,
@@ -221,12 +221,11 @@ fn dump(
 
     let output = longpath::for_open(&args.output);
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, length)?;
         return writeln!(
             out,
-            "dry-run: would read {length} bytes from {} at {}..{} into {output:?}",
-            args.device,
-            range.offset,
-            range.offset + length,
+            "dry-run: would read {length} bytes from {} at {}..{end} into {output:?}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }
@@ -257,7 +256,14 @@ fn flash(
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::ReadWrite, trace)?;
+    // Opening for write is what locks and dismounts mounted volumes on
+    // Windows, and a rehearsal must do neither.
+    let access = if opts.dry_run {
+        Access::Read
+    } else {
+        Access::ReadWrite
+    };
+    let mut device = backend.open(&args.device, access, trace)?;
     transfer::ensure_writable(device.info())?;
 
     let input = longpath::for_open(&args.input);
@@ -278,12 +284,11 @@ fn flash(
     }
 
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, input_len)?;
         return writeln!(
             out,
-            "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{}",
-            args.device,
-            range.offset,
-            range.offset + input_len,
+            "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{end}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }
@@ -337,14 +342,20 @@ fn verify(
     let mut device = backend.open(&args.device, Access::Read, trace)?;
     let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
         .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    if let Some(limit) = range.length
+        && length > limit
+    {
+        return Err(Error::InvalidArgument(format!(
+            "input is {length} bytes but the target range is {limit} bytes"
+        )));
+    }
 
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, length)?;
         return writeln!(
             out,
-            "dry-run: would compare {length} bytes of {} at {}..{} against {input:?}",
-            args.device,
-            range.offset,
-            range.offset + length,
+            "dry-run: would compare {length} bytes of {} at {}..{end} against {input:?}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }
@@ -361,39 +372,9 @@ fn compare(
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    const CHUNK: usize = 1 << 20;
-    let mut bar = opts.bar("verify");
-    let sector = device.info().logical_sector_size;
     let mut file = File::open(source).map_err(|e| Error::io(format!("opening {source:?}"), e))?;
-    let mut from_device = vec![0u8; CHUNK];
-    let mut from_file = vec![0u8; CHUNK];
-
-    let mut done = 0u64;
-    while done < length {
-        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
-        let aligned = usize::try_from(transfer::align_up(want as u64, sector)).unwrap_or(want);
-        let at = offset + done;
-
-        device
-            .read_at(at, &mut from_device[..aligned])
-            .map_err(|err| {
-                trace.failed(format!("verify read {aligned}B at {at}"), &err);
-                Error::Device(err)
-            })?;
-        file.read_exact(&mut from_file[..want])
-            .map_err(|e| Error::io("reading input file", e))?;
-
-        if let Some(i) = (0..want).position(|i| from_device[i] != from_file[i]) {
-            return Err(Error::VerifyFailed {
-                offset: at + i as u64,
-                expected: from_file[i],
-                found: from_device[i],
-            });
-        }
-        done += want as u64;
-        bar.advance(done, length);
-    }
-    bar.finish(done);
+    let mut bar = opts.bar("verify");
+    let done = transfer::verify(device, offset, length, &mut file, trace, bar.as_mut())?;
 
     writeln!(out, "verified {done} bytes at offset {offset}")
         .map_err(|e| Error::io("writing output", e))
@@ -520,6 +501,13 @@ fn print_table(out: &mut dyn Write, table: &Pit, at: u64, info: &DeviceInfo) -> 
 }
 
 fn read_pit(device: &mut dyn RawDevice, at: u64, trace: &Trace) -> Result<Pit> {
+    let hint = |err| match err {
+        Error::Pit(message) => Error::Pit(format!(
+            "{message} (looked at offset {at}; pass --pit-offset if the table is elsewhere)"
+        )),
+        other => other,
+    };
+
     let sector = usize::try_from(device.info().logical_sector_size).unwrap_or(512);
     let mut head = vec![0u8; sector.max(rawio_core::pit::HEADER_LEN)];
     device.read_at(at, &mut head).map_err(|err| {
@@ -528,26 +516,21 @@ fn read_pit(device: &mut dyn RawDevice, at: u64, trace: &Trace) -> Result<Pit> {
     })?;
     trace.ok(Stage::ParsePit, format!("read PIT header at {at}"), "ok");
 
-    let entry_count = u32::from_le_bytes(head[4..8].try_into().expect("header is long enough"));
-    let needed = rawio_core::pit::HEADER_LEN + entry_count as usize * rawio_core::pit::ENTRY_LEN;
+    // The header is validated before its entry count may size anything.
+    let needed = Pit::table_len(&head).map_err(hint)?;
     if needed > head.len() {
         let aligned = usize::try_from(transfer::align_up(
             needed as u64,
             device.info().logical_sector_size,
         ))
-        .map_err(|_| Error::Pit(format!("{entry_count} entries is implausible")))?;
+        .expect("table_len caps the entry count");
         head.resize(aligned, 0);
         device.read_at(at, &mut head).map_err(|err| {
             trace.failed(format!("read PIT table at {at}"), &err);
             Error::Device(err)
         })?;
     }
-    Pit::parse(&head).map_err(|err| match err {
-        Error::Pit(message) => Error::Pit(format!(
-            "{message} (looked at offset {at}; pass --pit-offset if the table is elsewhere)"
-        )),
-        other => other,
-    })
+    Pit::parse(&head).map_err(hint)
 }
 
 fn describe(info: &DeviceInfo) -> String {

@@ -24,6 +24,10 @@ pub const MAGIC: u32 = 0x1234_9876;
 pub const HEADER_LEN: usize = 28;
 pub const ENTRY_LEN: usize = 132;
 
+/// Entry counts above this are treated as garbage rather than sized for; real
+/// tables hold a few dozen entries.
+pub const MAX_ENTRIES: usize = 4096;
+
 /// The unit of `block_offset`/`block_count` is undocumented. 512 is an assumption;
 /// comparing a resolved range against an explicit-offset run is what disproves it.
 pub const ASSUMED_BLOCK_SIZE: u64 = 512;
@@ -93,31 +97,44 @@ pub struct Pit {
 }
 
 impl Pit {
-    /// Any failure here aborts before the device is read or written.
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
+    /// First phase of a two-phase read: proves everything a header-sized
+    /// prefix can prove - length, magic, a plausible entry count - and returns
+    /// the byte length of the whole table, so the caller never sizes an
+    /// allocation or a device read from unvalidated bytes.
+    pub fn table_len(head: &[u8]) -> Result<usize> {
+        if head.len() < HEADER_LEN {
             return Err(Error::Pit(format!(
                 "header truncated: {} bytes, need {HEADER_LEN}",
-                bytes.len()
+                head.len()
             )));
         }
-        let magic = u32_at(bytes, 0);
+        let magic = u32_at(head, 0);
         if magic != MAGIC {
             return Err(Error::Pit(format!(
                 "bad magic {magic:#010x}, expected {MAGIC:#010x}"
             )));
         }
+        let entry_count = u32_at(head, 4) as usize;
+        if entry_count > MAX_ENTRIES {
+            return Err(Error::Pit(format!(
+                "{entry_count} entries is implausible (at most {MAX_ENTRIES} expected)"
+            )));
+        }
+        Ok(HEADER_LEN + entry_count * ENTRY_LEN)
+    }
 
-        let entry_count = u32_at(bytes, 4) as usize;
-        let needed = HEADER_LEN + entry_count * ENTRY_LEN;
+    /// Any failure here aborts before the device is read or written.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let needed = Self::table_len(bytes)?;
         if bytes.len() < needed {
             return Err(Error::Pit(format!(
-                "{entry_count} entries need {needed} bytes, got {}",
+                "{} entries need {needed} bytes, got {}",
+                (needed - HEADER_LEN) / ENTRY_LEN,
                 bytes.len()
             )));
         }
 
-        let partitions = (0..entry_count)
+        let partitions = (0..(needed - HEADER_LEN) / ENTRY_LEN)
             .map(|i| parse_entry(&bytes[HEADER_LEN + i * ENTRY_LEN..][..ENTRY_LEN], i))
             .collect::<Result<Vec<_>>>()?;
 
@@ -237,6 +254,35 @@ mod tests {
         assert_eq!(log.identifier, 1);
         assert_eq!(log.byte_offset(), 8192 * 512);
         assert_eq!(log.byte_length(), 1024 * 512);
+    }
+
+    /// Garbage where the table was expected must fail on the magic, never
+    /// reach the entry count: the count sizes an allocation and a device read.
+    #[test]
+    fn table_len_rejects_garbage_before_sizing_anything() {
+        let message = Pit::table_len(&[0xFF; HEADER_LEN]).unwrap_err().to_string();
+        assert!(message.contains("magic"), "{message}");
+
+        assert!(Pit::table_len(&[0u8; HEADER_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn table_len_caps_an_implausible_entry_count() {
+        let mut head = build(&[]);
+        head[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let message = Pit::table_len(&head).unwrap_err().to_string();
+
+        assert!(message.contains("implausible"), "{message}");
+    }
+
+    #[test]
+    fn table_len_sizes_a_valid_header() {
+        let bytes = build(&[("BOOT", 0, 1), ("LOG", 8, 2)]);
+        assert_eq!(
+            Pit::table_len(&bytes[..HEADER_LEN]).unwrap(),
+            HEADER_LEN + 2 * ENTRY_LEN
+        );
     }
 
     #[test]

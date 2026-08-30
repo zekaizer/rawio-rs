@@ -90,6 +90,9 @@ pub struct MemoryDevice {
     data: Vec<u8>,
     /// Offset at which the next write fails, simulating a vanished device.
     fail_write_at: Option<u64>,
+    /// Offset at which the next read fails, simulating a vanished device.
+    fail_read_at: Option<u64>,
+    flushes: usize,
 }
 
 impl MemoryDevice {
@@ -104,11 +107,26 @@ impl MemoryDevice {
             },
             data: vec![0; size],
             fail_write_at: None,
+            fail_read_at: None,
+            flushes: 0,
         }
+    }
+
+    pub fn flushes(&self) -> usize {
+        self.flushes
     }
 
     pub fn fail_writes_from(&mut self, offset: u64) {
         self.fail_write_at = Some(offset);
+    }
+
+    pub fn fail_reads_from(&mut self, offset: u64) {
+        self.fail_read_at = Some(offset);
+    }
+
+    /// Simulates a device reporting an unusual logical sector size.
+    pub fn set_sector_size(&mut self, sector: u32) {
+        self.info.logical_sector_size = sector;
     }
 
     pub fn contents(&self) -> &[u8] {
@@ -144,6 +162,13 @@ impl RawDevice for MemoryDevice {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError> {
+        if self.fail_read_at.is_some_and(|fail| offset >= fail) {
+            return Err(DeviceError::with_os_error(
+                Stage::Read,
+                "device removed",
+                433,
+            ));
+        }
         let range = self.range(offset, buf.len())?;
         buf.copy_from_slice(&self.data[range]);
         Ok(buf.len())
@@ -163,6 +188,7 @@ impl RawDevice for MemoryDevice {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
+        self.flushes += 1;
         Ok(())
     }
 }

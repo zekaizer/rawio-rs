@@ -17,6 +17,8 @@ use rawio_core::trace::Trace;
 struct FakeBackend {
     device: Rc<RefCell<MemoryDevice>>,
     volumes: Vec<VolumeLock>,
+    /// Access requested by every `open`, in order.
+    opens: RefCell<Vec<Access>>,
 }
 
 impl FakeBackend {
@@ -24,6 +26,7 @@ impl FakeBackend {
         Self {
             device: Rc::new(RefCell::new(MemoryDevice::new("mem0", size, removability))),
             volumes: Vec::new(),
+            opens: RefCell::new(Vec::new()),
         }
     }
 }
@@ -40,9 +43,10 @@ impl Backend for FakeBackend {
     fn open(
         &self,
         id: &str,
-        _access: Access,
+        access: Access,
         _trace: &Trace,
     ) -> Result<Box<dyn RawDevice>, DeviceError> {
+        self.opens.borrow_mut().push(access);
         if id != "mem0" {
             return Err(DeviceError::new(
                 Stage::Open,
@@ -476,6 +480,122 @@ fn a_dry_run_flash_leaves_the_device_untouched() {
     assert_eq!(backend.device.borrow().contents(), before.as_slice());
 }
 
+/// A dry run exists to show what the real run would do, so it has to run the
+/// same range validation and refuse exactly what the real run refuses.
+#[test]
+fn a_dry_run_refuses_the_unaligned_offset_the_real_run_would() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("dryunaligned").join("img.bin");
+    std::fs::write(&input, vec![0u8; 512]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "100",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_dry_run_refuses_a_range_that_overflows() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let output = tempdir("dryoverflow").join("x.bin");
+
+    // Sector aligned, but offset + length wraps u64.
+    let (result, _) = run(
+        &[
+            "rawio",
+            "dump",
+            "mem0",
+            "--offset",
+            "18446744073709551104",
+            "--length",
+            "4096",
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_dry_run_refuses_a_range_past_the_device_end() {
+    let backend = FakeBackend::new(8192, Removability::Removable);
+    let input = tempdir("drybeyond").join("img.bin");
+    std::fs::write(&input, vec![0u8; 8192]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+/// The Windows backend locks and dismounts mounted volumes on a writable open,
+/// so a rehearsal must never ask for one; only the real flash may.
+#[test]
+fn a_dry_run_flash_never_opens_the_device_for_writing() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("dryaccess").join("img.bin");
+    std::fs::write(&input, vec![0x5A; 4096]).unwrap();
+    let flash = |dry: bool| {
+        let mut args = vec![
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "0",
+            "-i",
+            input.to_str().unwrap(),
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (result, _) = run(&args, &backend);
+        assert!(result.is_ok(), "dry={dry}: {result:?}");
+    };
+
+    flash(true);
+    assert_eq!(*backend.opens.borrow(), vec![Access::Read]);
+
+    flash(false);
+    assert_eq!(
+        *backend.opens.borrow(),
+        vec![Access::Read, Access::ReadWrite]
+    );
+}
+
 #[test]
 fn flash_can_read_back_what_it_wrote() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
@@ -542,6 +662,86 @@ fn verify_names_the_first_byte_that_differs() {
     assert!(message.contains("4196"), "{message}");
 }
 
+/// A file longer than the partition would be compared into the neighbouring
+/// partition; flash refuses that input, so verify has to as well.
+#[test]
+fn verify_rejects_input_longer_than_the_partition() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("LOG", 64, 128)]);
+    let input = tempdir("verifytoolong").join("big.bin");
+    std::fs::write(&input, vec![0u8; 128 << 10]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--partition",
+            "LOG",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+/// Verify walks the same device ranges the transfers do, so it has to refuse
+/// exactly what they refuse instead of failing later with a raw device error.
+#[test]
+fn verify_rejects_an_unaligned_offset_like_dump_does() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("verifyunaligned").join("img.bin");
+    std::fs::write(&input, vec![0u8; 512]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "100",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_a_range_past_the_device_end_before_reading() {
+    let backend = FakeBackend::new(8192, Removability::Removable);
+    let input = tempdir("verifybeyond").join("img.bin");
+    std::fs::write(&input, vec![0u8; 8192]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn a_length_larger_than_the_partition_is_rejected() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
@@ -577,6 +777,25 @@ fn a_missing_table_says_where_it_looked() {
     let (result, _) = run(&["rawio", "pit", "mem0"], &backend);
 
     let message = result.unwrap_err().to_string();
+    assert!(message.contains("--pit-offset"), "{message}");
+}
+
+/// Garbage at the PIT offset carries a garbage entry count; the parse failure
+/// has to come from the magic check, never from trying to size a read by it.
+#[test]
+fn garbage_where_the_pit_should_be_fails_on_the_magic() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    {
+        let mut device = backend.device.borrow_mut();
+        let sector = &mut device.contents_mut()[..512];
+        sector.fill(0xA5); // wrong magic
+        sector[4..8].copy_from_slice(&100_000u32.to_le_bytes()); // absurd count
+    }
+
+    let (result, _) = run(&["rawio", "pit", "mem0"], &backend);
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("magic"), "{message}");
     assert!(message.contains("--pit-offset"), "{message}");
 }
 

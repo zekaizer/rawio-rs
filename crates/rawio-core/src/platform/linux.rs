@@ -45,6 +45,9 @@ impl Backend for LinuxBackend {
         trace: &Trace,
     ) -> Result<Box<dyn RawDevice>, DeviceError> {
         let name = device_name(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
+        require_whole_device(&name).inspect_err(|err| {
+            trace.failed(format!("/dev/{name}"), err);
+        })?;
         let device = open_device(&name, access).inspect_err(|err| {
             trace.failed(format!("/dev/{name}"), err);
         })?;
@@ -56,6 +59,9 @@ impl Backend for LinuxBackend {
     /// filesystem is permitted. Taking a writable handle is the whole check.
     fn rehearse_write(&self, id: &str, trace: &Trace) -> Result<Vec<VolumeLock>, DeviceError> {
         let name = device_name(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
+        require_whole_device(&name).inspect_err(|err| {
+            trace.failed(format!("/dev/{name}"), err);
+        })?;
         let device = open_device(&name, Access::ReadWrite).inspect_err(|err| {
             trace.failed(format!("/dev/{name}"), err);
         })?;
@@ -141,18 +147,40 @@ fn read_attr(path: &str) -> Option<String> {
 }
 
 /// Accepts `sda` and `/dev/sda`; rejects partitions, which are not raw devices.
+///
+/// The patterns cover the common naming schemes only; `require_whole_device`
+/// is the general guard, and needs the live sysfs the tests do not have.
 pub fn device_name(id: &str) -> Result<String, String> {
     let name = id.trim().strip_prefix("/dev/").unwrap_or(id.trim());
     if name.is_empty() || name.contains('/') {
         return Err(format!("{id:?} is not a block device name"));
     }
-    if name.starts_with("sd") && name.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+    // Disks named with a trailing letter take bare partition numbers...
+    let lettered = ["sd", "hd", "vd", "xvd"];
+    if lettered.iter().any(|prefix| name.starts_with(prefix))
+        && name.chars().last().is_some_and(|c| c.is_ascii_digit())
+    {
         return Err(format!("{id:?} is a partition; pass the whole device"));
     }
-    if name.starts_with("mmcblk") && name.contains('p') {
+    // ...disks named with a trailing digit get a `p` separator instead.
+    let numbered = ["mmcblk", "nvme"];
+    if numbered.iter().any(|prefix| name.starts_with(prefix)) && name.contains('p') {
         return Err(format!("{id:?} is a partition; pass the whole device"));
     }
     Ok(name.to_string())
+}
+
+/// Partitions appear under their disk in sysfs, never at the top level, so
+/// `/sys/block` membership rejects every partition scheme the name patterns
+/// do not know - and typos with it.
+fn require_whole_device(name: &str) -> Result<(), DeviceError> {
+    if std::path::Path::new(SYSFS_BLOCK).join(name).exists() {
+        return Ok(());
+    }
+    Err(DeviceError::new(
+        Stage::Open,
+        format!("/dev/{name} is not a whole block device: {SYSFS_BLOCK}/{name} does not exist"),
+    ))
 }
 
 pub fn sysfs_removable_path(name: &str) -> String {
@@ -229,8 +257,19 @@ mod tests {
 
     #[test]
     fn partitions_are_rejected() {
-        assert!(device_name("/dev/sdb1").is_err());
-        assert!(device_name("mmcblk0p1").is_err());
+        for id in [
+            "/dev/sdb1",
+            "mmcblk0p1",
+            "/dev/nvme0n1p1",
+            "/dev/vda1",
+            "xvda2",
+            "hda1",
+        ] {
+            assert!(device_name(id).is_err(), "{id}");
+        }
+        for id in ["/dev/nvme0n1", "vda", "xvda", "hda", "md0"] {
+            assert!(device_name(id).is_ok(), "{id}");
+        }
     }
 
     #[test]
