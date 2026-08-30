@@ -2,7 +2,7 @@
 //! driven by a fake device in tests.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use crate::cli::{
     Cli, Command, DumpArgs, FlashArgs, Location, PitArgs, PitSource, ProbeArgs, TransferOptions,
@@ -361,39 +361,9 @@ fn compare(
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    const CHUNK: usize = 1 << 20;
-    let mut bar = opts.bar("verify");
-    let sector = device.info().logical_sector_size;
     let mut file = File::open(source).map_err(|e| Error::io(format!("opening {source:?}"), e))?;
-    let mut from_device = vec![0u8; CHUNK];
-    let mut from_file = vec![0u8; CHUNK];
-
-    let mut done = 0u64;
-    while done < length {
-        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
-        let aligned = usize::try_from(transfer::align_up(want as u64, sector)).unwrap_or(want);
-        let at = offset + done;
-
-        device
-            .read_at(at, &mut from_device[..aligned])
-            .map_err(|err| {
-                trace.failed(format!("verify read {aligned}B at {at}"), &err);
-                Error::Device(err)
-            })?;
-        file.read_exact(&mut from_file[..want])
-            .map_err(|e| Error::io("reading input file", e))?;
-
-        if let Some(i) = (0..want).position(|i| from_device[i] != from_file[i]) {
-            return Err(Error::VerifyFailed {
-                offset: at + i as u64,
-                expected: from_file[i],
-                found: from_device[i],
-            });
-        }
-        done += want as u64;
-        bar.advance(done, length);
-    }
-    bar.finish(done);
+    let mut bar = opts.bar("verify");
+    let done = transfer::verify(device, offset, length, &mut file, trace, bar.as_mut())?;
 
     writeln!(out, "verified {done} bytes at offset {offset}")
         .map_err(|e| Error::io("writing output", e))

@@ -239,6 +239,59 @@ pub fn flash(
     })
 }
 
+/// Reads the range back and compares it with `source`. Returns the number of
+/// bytes that matched; the first difference aborts with its offset. Shares the
+/// transfer guards so verify accepts exactly the ranges dump and flash do.
+pub fn verify(
+    device: &mut dyn RawDevice,
+    offset: u64,
+    length: u64,
+    source: &mut dyn Read,
+    trace: &Trace,
+    progress: &mut dyn Progress,
+) -> Result<u64> {
+    let sector = device.info().logical_sector_size;
+    require_aligned("offset", offset, sector)?;
+    ensure_within_device(device.info(), offset, align_up(length, sector))?;
+
+    let mut from_device = vec![0u8; CHUNK];
+    let mut from_file = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    while done < length {
+        let want = usize::try_from(length - done).unwrap_or(CHUNK).min(CHUNK);
+        let aligned = usize::try_from(align_up(want as u64, sector)).unwrap_or(want);
+        let at = offset + done;
+
+        device
+            .read_at(at, &mut from_device[..aligned])
+            .map_err(|err| {
+                trace.failed(format!("verify read {aligned}B at {at}"), &err);
+                Error::Device(err)
+            })?;
+        trace.ok(Stage::Read, format!("verify read {aligned}B at {at}"), "ok");
+        source
+            .read_exact(&mut from_file[..want])
+            .map_err(|e| Error::io("reading input file", e))?;
+
+        // Equal chunks are the common case; the byte scan runs only on the
+        // chunk that differs.
+        if from_device[..want] != from_file[..want] {
+            let i = (0..want)
+                .position(|i| from_device[i] != from_file[i])
+                .expect("the chunks differ");
+            return Err(Error::VerifyFailed {
+                offset: at + i as u64,
+                expected: from_file[i],
+                found: from_device[i],
+            });
+        }
+        done += want as u64;
+        progress.advance(done, length);
+    }
+    progress.finish(done);
+    Ok(done)
+}
+
 /// Restores the bytes past the end of the image inside the sector it ends in,
 /// so a length that is not a sector multiple leaves its neighbour intact. Only
 /// that one sector is read, and its start is sector aligned because `at` is.

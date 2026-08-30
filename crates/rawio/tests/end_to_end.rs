@@ -542,6 +542,58 @@ fn verify_names_the_first_byte_that_differs() {
     assert!(message.contains("4196"), "{message}");
 }
 
+/// Verify walks the same device ranges the transfers do, so it has to refuse
+/// exactly what they refuse instead of failing later with a raw device error.
+#[test]
+fn verify_rejects_an_unaligned_offset_like_dump_does() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("verifyunaligned").join("img.bin");
+    std::fs::write(&input, vec![0u8; 512]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "100",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_a_range_past_the_device_end_before_reading() {
+    let backend = FakeBackend::new(8192, Removability::Removable);
+    let input = tempdir("verifybeyond").join("img.bin");
+    std::fs::write(&input, vec![0u8; 8192]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn a_length_larger_than_the_partition_is_rejected() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
