@@ -33,6 +33,10 @@ the progress line still on screen.
 flash 32.0 MiB / 512.0 MiB    6%  16.0 MiB/s  30s
 ```
 
+`flash` pushes to the medium as it goes rather than only at the end, so the
+line tracks what the card has taken and not what the page cache has absorbed.
+The last push is reported as a wait, because it is one.
+
 ## Targeting
 
 A target is one of `--offset N`, `--partition NAME`, or `--partition-id N`; they
