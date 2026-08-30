@@ -67,10 +67,19 @@ impl DeviceError {
     }
 
     pub fn from_io(stage: Stage, err: &std::io::Error) -> Self {
+        let os_error = err.raw_os_error();
+        let text = err.to_string();
+        // `io::Error` renders the code into its own message; `Display` adds it back.
+        let message = match os_error {
+            Some(code) => text
+                .trim_end_matches(&format!(" (os error {code})"))
+                .to_string(),
+            None => text,
+        };
         Self {
             stage,
-            message: err.to_string(),
-            os_error: err.raw_os_error(),
+            message,
+            os_error,
         }
     }
 }
@@ -153,6 +162,24 @@ mod tests {
     fn device_error_display_carries_stage_and_os_code() {
         let err = DeviceError::with_os_error(Stage::LockVolume, "access denied", 5);
         assert_eq!(err.to_string(), "[lock-volume] access denied (os error 5)");
+    }
+
+    /// `io::Error` already renders the code into its own message, so the raw
+    /// value has to be taken out before `Display` puts it back.
+    #[test]
+    fn an_os_error_is_reported_once() {
+        let err = DeviceError::from_io(
+            Stage::Open,
+            &std::io::Error::from_raw_os_error(libc_eacces()),
+        );
+
+        assert_eq!(err.os_error, Some(libc_eacces()));
+        assert!(!err.message.contains("os error"), "{}", err.message);
+        assert_eq!(err.to_string().matches("os error").count(), 1, "{err}");
+    }
+
+    fn libc_eacces() -> i32 {
+        13
     }
 
     #[test]
