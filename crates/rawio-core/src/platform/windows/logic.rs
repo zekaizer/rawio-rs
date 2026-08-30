@@ -82,6 +82,25 @@ pub fn parse_bytes_per_sector(buf: &[u8]) -> Option<u32> {
     u32_at(buf, 20).filter(|size| *size != 0)
 }
 
+/// `GET_LENGTH_INFO`: a single little-endian byte length.
+pub fn parse_length_info(buf: &[u8]) -> Option<u64> {
+    let bytes = buf.get(..8)?;
+    Some(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+}
+
+/// `DISK_GEOMETRY` as a size: cylinders (8B at 0) x `TracksPerCylinder` (at 12)
+/// x `SectorsPerTrack` (at 16) x `BytesPerSector` (at 20). Rounded down to a
+/// cylinder boundary, so it understates the disk; it is the fallback for
+/// handles that may not carry the read access `GET_LENGTH_INFO` demands.
+pub fn parse_geometry_size(buf: &[u8]) -> Option<u64> {
+    let cylinders = u64::from_le_bytes(buf.get(..8)?.try_into().expect("eight bytes"));
+    let size = cylinders
+        .checked_mul(u64::from(u32_at(buf, 12)?))?
+        .checked_mul(u64::from(u32_at(buf, 16)?))?
+        .checked_mul(u64::from(u32_at(buf, 20)?))?;
+    (size != 0).then_some(size)
+}
+
 /// Volumes are reached by drive letter. A volume with no letter is not mounted
 /// by a filesystem either, so it cannot be the one blocking a write.
 pub fn volume_path(letter: char) -> String {
@@ -260,6 +279,28 @@ mod tests {
         assert_eq!(parse_bytes_per_sector(&buf), Some(4096));
         assert_eq!(parse_bytes_per_sector(&[0u8; 24]), None);
         assert_eq!(parse_bytes_per_sector(&[0u8; 8]), None);
+    }
+
+    #[test]
+    fn length_info_is_a_single_byte_count() {
+        let mut buf = vec![0u8; 8];
+        buf.copy_from_slice(&(31_914_983_424u64).to_le_bytes());
+
+        assert_eq!(parse_length_info(&buf), Some(31_914_983_424));
+        assert_eq!(parse_length_info(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn geometry_multiplies_out_to_a_fallback_size() {
+        let mut buf = vec![0u8; 24];
+        buf[0..8].copy_from_slice(&3800u64.to_le_bytes()); // cylinders
+        buf[12..16].copy_from_slice(&255u32.to_le_bytes()); // tracks per cylinder
+        buf[16..20].copy_from_slice(&63u32.to_le_bytes()); // sectors per track
+        buf[20..24].copy_from_slice(&512u32.to_le_bytes()); // bytes per sector
+
+        assert_eq!(parse_geometry_size(&buf), Some(3800 * 255 * 63 * 512));
+        assert_eq!(parse_geometry_size(&[0u8; 24]), None);
+        assert_eq!(parse_geometry_size(&[0u8; 8]), None);
     }
 
     #[test]

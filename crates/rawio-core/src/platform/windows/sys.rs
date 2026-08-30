@@ -23,9 +23,14 @@ pub fn enumerate(trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
     let mut devices = Vec::new();
     for index in 0..MAX_DRIVES {
         let path = logic::physical_drive_path(index);
-        // Zero desired access opens the device for queries only, which needs no
-        // elevation, so listing works from an ordinary shell.
-        let Ok(handle) = OpenOptions::new().access_mode(0).open(&path) else {
+        // GET_LENGTH_INFO demands read access, which an unelevated shell may
+        // not get; the zero-access fallback still opens for queries and lists
+        // the disk with a geometry-derived size.
+        let Ok(handle) = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .or_else(|_| OpenOptions::new().access_mode(0).open(&path))
+        else {
             continue;
         };
         trace.ok(Stage::Enumerate, &path, "present");
@@ -86,6 +91,18 @@ fn describe(index: u32, file: &File, trace: &Trace) -> DeviceInfo {
     .ok()
     .and_then(|buf| logic::parse_device_descriptor(&buf));
 
+    let geometry = control(
+        file,
+        logic::IOCTL_DISK_GET_DRIVE_GEOMETRY,
+        &[],
+        24,
+        Stage::QueryGeometry,
+    )
+    .inspect_err(|err| trace.failed(format!("{path} DISK_GET_DRIVE_GEOMETRY"), err))
+    .ok();
+
+    // The exact length needs a read-access handle; the geometry product is the
+    // cylinder-rounded stand-in when the handle cannot carry that.
     let size_bytes = control(
         file,
         logic::IOCTL_DISK_GET_LENGTH_INFO,
@@ -95,22 +112,13 @@ fn describe(index: u32, file: &File, trace: &Trace) -> DeviceInfo {
     )
     .inspect_err(|err| trace.failed(format!("{path} DISK_GET_LENGTH_INFO"), err))
     .ok()
-    .and_then(|buf| {
-        buf.get(..8)
-            .map(|len| u64::from_le_bytes(len.try_into().unwrap()))
-    });
+    .and_then(|buf| logic::parse_length_info(&buf))
+    .or_else(|| geometry.as_deref().and_then(logic::parse_geometry_size));
 
-    let logical_sector_size = control(
-        file,
-        logic::IOCTL_DISK_GET_DRIVE_GEOMETRY,
-        &[],
-        24,
-        Stage::QueryGeometry,
-    )
-    .inspect_err(|err| trace.failed(format!("{path} DISK_GET_DRIVE_GEOMETRY"), err))
-    .ok()
-    .and_then(|buf| logic::parse_bytes_per_sector(&buf))
-    .unwrap_or(512);
+    let logical_sector_size = geometry
+        .as_deref()
+        .and_then(logic::parse_bytes_per_sector)
+        .unwrap_or(512);
 
     let removability = descriptor.as_ref().map_or(Removability::Unknown, |it| {
         logic::classify(it.removable_media, it.bus_type)
