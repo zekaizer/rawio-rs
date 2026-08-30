@@ -742,6 +742,25 @@ fn a_missing_table_says_where_it_looked() {
     assert!(message.contains("--pit-offset"), "{message}");
 }
 
+/// Garbage at the PIT offset carries a garbage entry count; the parse failure
+/// has to come from the magic check, never from trying to size a read by it.
+#[test]
+fn garbage_where_the_pit_should_be_fails_on_the_magic() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    {
+        let mut device = backend.device.borrow_mut();
+        let sector = &mut device.contents_mut()[..512];
+        sector.fill(0xA5); // wrong magic
+        sector[4..8].copy_from_slice(&100_000u32.to_le_bytes()); // absurd count
+    }
+
+    let (result, _) = run(&["rawio", "pit", "mem0"], &backend);
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("magic"), "{message}");
+    assert!(message.contains("--pit-offset"), "{message}");
+}
+
 #[test]
 fn a_device_without_a_pit_aborts_instead_of_transferring() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);

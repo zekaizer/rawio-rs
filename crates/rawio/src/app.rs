@@ -494,6 +494,13 @@ fn print_table(out: &mut dyn Write, table: &Pit, at: u64, info: &DeviceInfo) -> 
 }
 
 fn read_pit(device: &mut dyn RawDevice, at: u64, trace: &Trace) -> Result<Pit> {
+    let hint = |err| match err {
+        Error::Pit(message) => Error::Pit(format!(
+            "{message} (looked at offset {at}; pass --pit-offset if the table is elsewhere)"
+        )),
+        other => other,
+    };
+
     let sector = usize::try_from(device.info().logical_sector_size).unwrap_or(512);
     let mut head = vec![0u8; sector.max(rawio_core::pit::HEADER_LEN)];
     device.read_at(at, &mut head).map_err(|err| {
@@ -502,26 +509,21 @@ fn read_pit(device: &mut dyn RawDevice, at: u64, trace: &Trace) -> Result<Pit> {
     })?;
     trace.ok(Stage::ParsePit, format!("read PIT header at {at}"), "ok");
 
-    let entry_count = u32::from_le_bytes(head[4..8].try_into().expect("header is long enough"));
-    let needed = rawio_core::pit::HEADER_LEN + entry_count as usize * rawio_core::pit::ENTRY_LEN;
+    // The header is validated before its entry count may size anything.
+    let needed = Pit::table_len(&head).map_err(hint)?;
     if needed > head.len() {
         let aligned = usize::try_from(transfer::align_up(
             needed as u64,
             device.info().logical_sector_size,
         ))
-        .map_err(|_| Error::Pit(format!("{entry_count} entries is implausible")))?;
+        .expect("table_len caps the entry count");
         head.resize(aligned, 0);
         device.read_at(at, &mut head).map_err(|err| {
             trace.failed(format!("read PIT table at {at}"), &err);
             Error::Device(err)
         })?;
     }
-    Pit::parse(&head).map_err(|err| match err {
-        Error::Pit(message) => Error::Pit(format!(
-            "{message} (looked at offset {at}; pass --pit-offset if the table is elsewhere)"
-        )),
-        other => other,
-    })
+    Pit::parse(&head).map_err(hint)
 }
 
 fn describe(info: &DeviceInfo) -> String {
