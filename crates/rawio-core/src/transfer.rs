@@ -197,7 +197,7 @@ pub fn flash(
             // bytes past its end survive.
             if aligned > want {
                 keep_tail(device, at, want, sector, &mut buf, trace)
-                    .map_err(|err| abort(at, done, err))?;
+                    .map_err(|err| abort(offset, done, err))?;
             }
 
             device.write_at(at, &buf[..aligned]).map_err(|err| {
@@ -465,6 +465,33 @@ mod tests {
             other => panic!("unexpected error: {other}"),
         }
         assert_eq!(err.exit_code(), 5);
+    }
+
+    /// `start` is where the transfer began, whichever step failed; a recovery
+    /// that reads `start + written` must not be pointed at the failing chunk.
+    #[test]
+    fn a_tail_read_back_failure_reports_the_transfer_start() {
+        let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+        device.fail_reads_from(4096 + (1 << 20));
+        let data = pattern((1 << 20) + 100);
+
+        let err = flash(
+            &mut device,
+            4096,
+            data.len() as u64,
+            &mut data.as_slice(),
+            &Trace::new(),
+            &mut Silent,
+        )
+        .unwrap_err();
+
+        match err {
+            Error::WriteAborted { start, written, .. } => {
+                assert_eq!(start, 4096);
+                assert_eq!(written, 1 << 20);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     /// Errors from the far side of the transfer have to survive the handoff.
