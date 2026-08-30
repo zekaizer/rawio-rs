@@ -124,6 +124,11 @@ impl MemoryDevice {
         self.fail_read_at = Some(offset);
     }
 
+    /// Simulates a device reporting an unusual logical sector size.
+    pub fn set_sector_size(&mut self, sector: u32) {
+        self.info.logical_sector_size = sector;
+    }
+
     pub fn contents(&self) -> &[u8] {
         &self.data
     }

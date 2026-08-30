@@ -35,6 +35,23 @@ pub fn align_up(value: u64, sector: u32) -> u64 {
     value.div_ceil(sector) * sector
 }
 
+/// The chunk math assumes the sector size divides `CHUNK`; any other value
+/// would overrun the transfer buffers, so the device is refused up front.
+fn require_usable_sector(info: &DeviceInfo) -> Result<()> {
+    let sector = info.logical_sector_size;
+    if sector == 0 || !sector.is_power_of_two() || sector as usize > CHUNK {
+        return Err(Error::Device(DeviceError::new(
+            Stage::QueryGeometry,
+            format!(
+                "{} reports logical sector size {sector}, which cannot chunk a \
+                 transfer (need a power of two of at most {CHUNK})",
+                info.id
+            ),
+        )));
+    }
+    Ok(())
+}
+
 pub fn require_aligned(label: &str, value: u64, sector: u32) -> Result<()> {
     if value % u64::from(sector) != 0 {
         return Err(Error::InvalidArgument(format!(
@@ -79,6 +96,7 @@ pub fn dump(
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
+    require_usable_sector(device.info())?;
     let sector = device.info().logical_sector_size;
     require_aligned("offset", offset, sector)?;
     ensure_within_device(device.info(), offset, align_up(length, sector))?;
@@ -154,6 +172,7 @@ pub fn flash(
     progress: &mut dyn Progress,
 ) -> Result<u64> {
     ensure_writable(device.info())?;
+    require_usable_sector(device.info())?;
     let sector = device.info().logical_sector_size;
     require_aligned("offset", offset, sector)?;
     ensure_within_device(device.info(), offset, align_up(length, sector))?;
@@ -250,6 +269,7 @@ pub fn verify(
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
+    require_usable_sector(device.info())?;
     let sector = device.info().logical_sector_size;
     require_aligned("offset", offset, sector)?;
     ensure_within_device(device.info(), offset, align_up(length, sector))?;
@@ -657,6 +677,29 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::Io { .. }), "{err}");
+    }
+
+    /// The chunk math holds only for sector sizes that divide the chunk; a
+    /// device reporting anything else must be refused, not overrun a buffer.
+    #[test]
+    fn a_sector_size_that_cannot_chunk_is_refused_not_a_panic() {
+        for sector in [0u32, 520, 4224, (CHUNK as u32) * 2] {
+            let mut device = MemoryDevice::new("mem0", 4 << 20, Removability::Removable);
+            device.set_sector_size(sector);
+
+            let err = dump(
+                &mut device,
+                0,
+                2 << 20,
+                &mut Vec::new(),
+                &Trace::new(),
+                &mut Silent,
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, Error::Device(_)), "sector {sector}: {err}");
+            assert!(err.to_string().contains("sector"), "sector {sector}: {err}");
+        }
     }
 
     #[test]
