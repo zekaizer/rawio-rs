@@ -35,6 +35,9 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
   layer would break. Device arguments keep their own per-backend syntax. The one
   exception is `longpath::extend`, which adds the extended-length prefix when a
   path is at or beyond `MAX_PATH` and would otherwise be rejected outright.
+- Every command that acts on a range must be able to show what it resolved to
+  without acting: `--dry-run` on dump, flash and verify, and `rawio pit` for the
+  table. There are no interactive prompts to fall back on.
 - The PIT layout is reverse engineered, not specified. Two sources agree on it
   (an XDA analysis and github.com/CruelKernel/samsung_pit), but no real card has
   been parsed yet. Keep it opt-in, keep printing the header and the resolved

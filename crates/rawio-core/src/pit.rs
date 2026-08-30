@@ -129,11 +129,38 @@ impl Pit {
         })
     }
 
+    /// Identifiers are the other addressable column of the table.
+    pub fn find_by_id(&self, id: u32) -> Result<&Partition> {
+        self.partitions
+            .iter()
+            .find(|p| p.identifier == id)
+            .ok_or_else(|| {
+                let ids = self
+                    .partitions
+                    .iter()
+                    .map(|p| format!("{}={}", p.identifier, p.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Error::Pit(format!("no partition with id {id}; the table has: {ids}"))
+            })
+    }
+
+    /// The name has to come from the table, so a miss reports what is there.
     pub fn find(&self, name: &str) -> Result<&Partition> {
         self.partitions
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| Error::Pit(format!("no partition named {name:?}")))
+            .ok_or_else(|| {
+                let names = self
+                    .partitions
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Error::Pit(format!(
+                    "no partition named {name:?}; the table has: {names}"
+                ))
+            })
     }
 }
 
@@ -227,8 +254,35 @@ mod tests {
     }
 
     #[test]
-    fn unknown_partition_name_is_an_error() {
-        let pit = Pit::parse(&build(&[("BOOT", 0, 1)])).unwrap();
-        assert!(pit.find("nope").is_err());
+    fn a_partition_is_addressable_by_identifier() {
+        let pit = Pit::parse(&build(&[("BOOT", 0, 1), ("LOG", 8, 2)])).unwrap();
+
+        assert_eq!(pit.find_by_id(1).unwrap().name, "LOG");
+        assert_eq!(pit.find_by_id(1).unwrap(), pit.find("LOG").unwrap());
+    }
+
+    #[test]
+    fn an_unknown_identifier_reports_the_ones_that_exist() {
+        let pit = Pit::parse(&build(&[("BOOT", 0, 1), ("LOG", 8, 2)])).unwrap();
+
+        let message = pit.find_by_id(9).unwrap_err().to_string();
+
+        assert!(
+            message.contains("0=BOOT") && message.contains("1=LOG"),
+            "{message}"
+        );
+    }
+
+    /// The name has to come from somewhere, and the table is the only source.
+    #[test]
+    fn an_unknown_name_reports_the_names_that_exist() {
+        let pit = Pit::parse(&build(&[("BOOT", 0, 1), ("LOG", 1, 1)])).unwrap();
+
+        let message = pit.find("nope").unwrap_err().to_string();
+
+        assert!(
+            message.contains("BOOT") && message.contains("LOG"),
+            "{message}"
+        );
     }
 }

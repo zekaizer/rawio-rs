@@ -9,9 +9,10 @@ Windows 11 and Linux from the same argument syntax.
 
 ```
 rawio list                                  # enumerate candidate devices
-rawio probe  <device>                       # non-destructive pre-flight report
-rawio dump   <device> --offset N --length N --output FILE
-rawio flash  <device> --offset N --input FILE
+rawio probe  <device> [--pit]               # non-destructive pre-flight report
+rawio pit    <device>                       # print the PIT partition table
+rawio dump   <device> <target> --length N --output FILE
+rawio flash  <device> <target> --input FILE
 ```
 
 `--offset` / `--length` accept decimal, `0x` hex, and `K`/`M`/`G` suffixes. An
@@ -19,8 +20,33 @@ offset that is not a multiple of the device's logical sector size is rejected
 rather than rounded. A write whose length is not a multiple of the sector size
 reads the final sector back first, so the bytes after the image survive.
 
-Target selection by PIT partition name is opt-in (`--partition NAME`) and always
-prints the resolved offset and length before touching the device.
+`--dry-run` resolves the target, prints what would happen, and stops without
+reading or writing the device.
+
+## Targeting
+
+A target is one of `--offset N`, `--partition NAME`, or `--partition-id N`; they
+are mutually exclusive. The two partition forms read the PIT, which is otherwise
+never touched, and always print the range they resolved to before acting on it.
+
+`rawio pit` prints the whole table, which is where the names and identifiers
+come from:
+
+```
+pit: read at offset 0 - chip="EMMC16" port="COM4" format="FILE", 2 entries
+pit: block size 512 assumed; every byte column below depends on it
+device: \\.\PhysicalDrive2  29.7 GiB  removable  sector=512  Generic SD/MMC
+
+  NAME             TYPE     ID   BLOCK OFF    BLOCKS     BYTE OFFSET     BYTE LEN       SIZE  FLASH FILE
+  BOOT             mmc       0        2048       128         1048576        65536    64.0 KiB  boot.img
+  LOG              mmc       1        8192      1024         4194304       524288   512.0 KiB  -
+```
+
+The PIT layout is reverse engineered and its block size is assumed to be 512, so
+the byte columns can be plausible and still wrong. An entry that resolves past
+the end of the device is flagged, and a partition that resolves past the end
+aborts rather than transferring. `--pit-offset N` moves where the table is read
+from; the format does not fix its location.
 
 ## File paths
 
