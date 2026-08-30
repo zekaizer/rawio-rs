@@ -87,6 +87,23 @@ fn ensure_within_device(info: &DeviceInfo, offset: u64, length: u64) -> Result<(
     Ok(())
 }
 
+/// Everything a range operation proves before it touches the device, shared
+/// with `--dry-run` so a rehearsal approves exactly what the real run would.
+/// Returns the exclusive end of the range.
+pub fn check_range(info: &DeviceInfo, offset: u64, length: u64) -> Result<u64> {
+    require_usable_sector(info)?;
+    let sector = info.logical_sector_size;
+    require_aligned("offset", offset, sector)?;
+    let overflow =
+        || Error::InvalidArgument(format!("offset {offset} + length {length} overflows"));
+    let end = offset.checked_add(length).ok_or_else(overflow)?;
+    let aligned = length
+        .checked_next_multiple_of(u64::from(sector))
+        .ok_or_else(overflow)?;
+    ensure_within_device(info, offset, aligned)?;
+    Ok(end)
+}
+
 /// Returns the number of bytes written to `sink`.
 pub fn dump(
     device: &mut dyn RawDevice,
@@ -96,10 +113,8 @@ pub fn dump(
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
-    require_usable_sector(device.info())?;
+    check_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
-    require_aligned("offset", offset, sector)?;
-    ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
     // The sink runs on its own thread so the next device read overlaps the write
     // of the chunk before it. The device stays here: `RawDevice` is not `Send`,
@@ -172,10 +187,8 @@ pub fn flash(
     progress: &mut dyn Progress,
 ) -> Result<u64> {
     ensure_writable(device.info())?;
-    require_usable_sector(device.info())?;
+    check_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
-    require_aligned("offset", offset, sector)?;
-    ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
     // Mirror of dump: the source is read on its own thread so the file read of
     // the next chunk overlaps the device write of this one.
@@ -269,10 +282,8 @@ pub fn verify(
     trace: &Trace,
     progress: &mut dyn Progress,
 ) -> Result<u64> {
-    require_usable_sector(device.info())?;
+    check_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
-    require_aligned("offset", offset, sector)?;
-    ensure_within_device(device.info(), offset, align_up(length, sector))?;
 
     let mut from_device = vec![0u8; CHUNK];
     let mut from_file = vec![0u8; CHUNK];

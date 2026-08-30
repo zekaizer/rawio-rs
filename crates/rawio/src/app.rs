@@ -221,12 +221,11 @@ fn dump(
 
     let output = longpath::for_open(&args.output);
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, length)?;
         return writeln!(
             out,
-            "dry-run: would read {length} bytes from {} at {}..{} into {output:?}",
-            args.device,
-            range.offset,
-            range.offset + length,
+            "dry-run: would read {length} bytes from {} at {}..{end} into {output:?}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }
@@ -278,12 +277,11 @@ fn flash(
     }
 
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, input_len)?;
         return writeln!(
             out,
-            "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{}",
-            args.device,
-            range.offset,
-            range.offset + input_len,
+            "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{end}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }
@@ -339,12 +337,11 @@ fn verify(
         .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
 
     if opts.dry_run {
+        let end = transfer::check_range(device.info(), range.offset, length)?;
         return writeln!(
             out,
-            "dry-run: would compare {length} bytes of {} at {}..{} against {input:?}",
-            args.device,
-            range.offset,
-            range.offset + length,
+            "dry-run: would compare {length} bytes of {} at {}..{end} against {input:?}",
+            args.device, range.offset,
         )
         .map_err(|e| Error::io("writing output", e));
     }

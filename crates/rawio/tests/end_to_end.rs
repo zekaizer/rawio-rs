@@ -476,6 +476,88 @@ fn a_dry_run_flash_leaves_the_device_untouched() {
     assert_eq!(backend.device.borrow().contents(), before.as_slice());
 }
 
+/// A dry run exists to show what the real run would do, so it has to run the
+/// same range validation and refuse exactly what the real run refuses.
+#[test]
+fn a_dry_run_refuses_the_unaligned_offset_the_real_run_would() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("dryunaligned").join("img.bin");
+    std::fs::write(&input, vec![0u8; 512]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "100",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_dry_run_refuses_a_range_that_overflows() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let output = tempdir("dryoverflow").join("x.bin");
+
+    // Sector aligned, but offset + length wraps u64.
+    let (result, _) = run(
+        &[
+            "rawio",
+            "dump",
+            "mem0",
+            "--offset",
+            "18446744073709551104",
+            "--length",
+            "4096",
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_dry_run_refuses_a_range_past_the_device_end() {
+    let backend = FakeBackend::new(8192, Removability::Removable);
+    let input = tempdir("drybeyond").join("img.bin");
+    std::fs::write(&input, vec![0u8; 8192]).unwrap();
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "verify",
+            "mem0",
+            "--offset",
+            "4096",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn flash_can_read_back_what_it_wrote() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
