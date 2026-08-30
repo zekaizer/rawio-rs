@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::cli::{Cli, Command, DumpArgs, FlashArgs, Location, ProbeArgs};
+use crate::longpath;
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
 use rawio_core::error::{Error, Result, Stage};
 use rawio_core::pit::Pit;
@@ -77,13 +78,14 @@ fn dump(args: &DumpArgs, backend: &dyn Backend, out: &mut dyn Write, trace: &Tra
         .length
         .ok_or_else(|| Error::InvalidArgument("--length is required with --offset".into()))?;
 
-    let mut file = File::create(&args.output)
-        .map_err(|e| Error::io(format!("creating {:?}", args.output), e))?;
+    let output = longpath::for_open(&args.output);
+    let mut file =
+        File::create(&output).map_err(|e| Error::io(format!("creating {output:?}"), e))?;
     let written = transfer::dump(&mut *device, range.offset, length, &mut file, trace)?;
     writeln!(
         out,
-        "dumped {written} bytes from offset {} to {:?}",
-        range.offset, args.output
+        "dumped {written} bytes from offset {} to {output:?}",
+        range.offset
     )
     .map_err(|e| Error::io("writing output", e))
 }
@@ -97,11 +99,11 @@ fn flash(
     let mut device = backend.open(&args.device, Access::ReadWrite)?;
     transfer::ensure_writable(device.info())?;
 
-    let mut file =
-        File::open(&args.input).map_err(|e| Error::io(format!("opening {:?}", args.input), e))?;
+    let input = longpath::for_open(&args.input);
+    let mut file = File::open(&input).map_err(|e| Error::io(format!("opening {input:?}"), e))?;
     let input_len = file
         .metadata()
-        .map_err(|e| Error::io(format!("stat {:?}", args.input), e))?
+        .map_err(|e| Error::io(format!("stat {input:?}"), e))?
         .len();
 
     let range = resolve(&mut *device, &args.location, None, out, trace)?

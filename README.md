@@ -37,6 +37,11 @@ means the special path forms all work as they do in any other program:
 Reaching a file inside WSL needs that distribution to be running; if it is not,
 the failure is reported with the raw Windows error code.
 
+Paths at or beyond Windows' 260 character limit are rewritten into the
+extended-length form (`\\?\C:\...`, `\\?\UNC\server\share\...`) just before the
+file is opened, so a deeply nested WSL path works without the caller doing
+anything. Shorter paths are opened exactly as typed.
+
 ## Safety
 
 `flash` refuses any device that is not reported as removable. There is no

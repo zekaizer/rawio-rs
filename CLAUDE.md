@@ -32,7 +32,9 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - `flash` has no removable-check override. Do not add one.
 - `--input` / `--output` reach the OS verbatim. Do not rewrite them: the WSL
   shares, `\\?\` and UNC are all valid Windows paths that any translation
-  layer would break. Device arguments keep their own per-backend syntax.
+  layer would break. Device arguments keep their own per-backend syntax. The one
+  exception is `longpath::extend`, which adds the extended-length prefix when a
+  path is at or beyond `MAX_PATH` and would otherwise be rejected outright.
 - The PIT layout is reverse engineered, not specified. Two sources agree on it
   (an XDA analysis and github.com/CruelKernel/samsung_pit), but no real card has
   been parsed yet. Keep it opt-in, keep printing the header and the resolved
