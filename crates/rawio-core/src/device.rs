@@ -2,6 +2,7 @@
 //! testable on any host, including hosts that have no device access.
 
 use crate::error::{DeviceError, Stage};
+use crate::trace::Trace;
 
 /// Only `Removable` may be written. `Unknown` is treated as fixed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,9 +51,16 @@ pub trait RawDevice {
     fn flush(&mut self) -> Result<(), DeviceError>;
 }
 
+/// The trace is passed in because opening a device is itself several steps, and
+/// which one failed is the whole point of the report.
 pub trait Backend {
-    fn enumerate(&self) -> Result<Vec<DeviceInfo>, DeviceError>;
-    fn open(&self, id: &str, access: Access) -> Result<Box<dyn RawDevice>, DeviceError>;
+    fn enumerate(&self, trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError>;
+    fn open(
+        &self,
+        id: &str,
+        access: Access,
+        trace: &Trace,
+    ) -> Result<Box<dyn RawDevice>, DeviceError>;
 }
 
 /// In-memory device backing the transfer, alignment and PIT tests.

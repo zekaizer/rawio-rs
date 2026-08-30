@@ -22,15 +22,15 @@ pub struct Range {
 
 pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
     match &cli.command {
-        Command::List => list(backend, out),
+        Command::List => list(backend, out, trace),
         Command::Probe(args) => probe(args, backend, out, trace),
         Command::Dump(args) => dump(args, backend, out, trace),
         Command::Flash(args) => flash(args, backend, out, trace),
     }
 }
 
-fn list(backend: &dyn Backend, out: &mut dyn Write) -> Result<()> {
-    let devices = backend.enumerate()?;
+fn list(backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
+    let devices = backend.enumerate(trace)?;
     if devices.is_empty() {
         writeln!(out, "no devices found").map_err(|e| Error::io("writing output", e))?;
         return Ok(());
@@ -48,12 +48,12 @@ fn probe(
     out: &mut dyn Write,
     trace: &Trace,
 ) -> Result<()> {
-    let devices = backend.enumerate()?;
+    let devices = backend.enumerate(trace)?;
     for info in &devices {
         writeln!(out, "device: {}", describe(info)).map_err(|e| Error::io("writing output", e))?;
     }
 
-    let mut device = backend.open(&args.device, Access::Read)?;
+    let mut device = backend.open(&args.device, Access::Read, trace)?;
     let info = device.info().clone();
     writeln!(out, "target: {}", describe(&info)).map_err(|e| Error::io("writing output", e))?;
     writeln!(out, "writable: {}", info.removability.writable())
@@ -71,7 +71,7 @@ fn probe(
 }
 
 fn dump(args: &DumpArgs, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::Read)?;
+    let mut device = backend.open(&args.device, Access::Read, trace)?;
     let range = resolve(&mut *device, &args.location, args.length, out, trace)?
         .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
     let length = range
@@ -96,7 +96,7 @@ fn flash(
     out: &mut dyn Write,
     trace: &Trace,
 ) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::ReadWrite)?;
+    let mut device = backend.open(&args.device, Access::ReadWrite, trace)?;
     transfer::ensure_writable(device.info())?;
 
     let input = longpath::for_open(&args.input);

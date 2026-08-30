@@ -8,6 +8,7 @@ mod sys;
 
 use crate::device::{Access, Backend, DeviceInfo, RawDevice};
 use crate::error::{DeviceError, Stage};
+use crate::trace::Trace;
 
 #[derive(Debug, Default)]
 pub struct WindowsBackend;
@@ -19,7 +20,8 @@ impl WindowsBackend {
 }
 
 impl Backend for WindowsBackend {
-    fn enumerate(&self) -> Result<Vec<DeviceInfo>, DeviceError> {
+    fn enumerate(&self, trace: &Trace) -> Result<Vec<DeviceInfo>, DeviceError> {
+        let _ = trace;
         #[cfg(windows)]
         {
             sys::enumerate()
@@ -33,7 +35,13 @@ impl Backend for WindowsBackend {
         }
     }
 
-    fn open(&self, id: &str, access: Access) -> Result<Box<dyn RawDevice>, DeviceError> {
+    fn open(
+        &self,
+        id: &str,
+        access: Access,
+        trace: &Trace,
+    ) -> Result<Box<dyn RawDevice>, DeviceError> {
+        let _ = trace;
         let index =
             logic::parse_device_id(id).map_err(|message| DeviceError::new(Stage::Open, message))?;
         #[cfg(windows)]
