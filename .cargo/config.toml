@@ -1,0 +1,7 @@
+# Cross linkers. On macOS these come from `brew install musl-cross mingw-w64`;
+# on the CI Linux runner the mingw name is the same after apt-get.
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
