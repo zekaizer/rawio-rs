@@ -1,0 +1,9 @@
+//! Device access and transfer logic. No terminal output and no argument parsing
+//! live here - the CLI crate owns both.
+
+pub mod device;
+pub mod error;
+pub mod pit;
+pub mod platform;
+pub mod trace;
+pub mod transfer;
