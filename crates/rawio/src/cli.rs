@@ -7,7 +7,11 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "rawio",
     version,
-    about = "Raw offset read/write for removable devices"
+    about = concat!(
+        "rawio ",
+        env!("CARGO_PKG_VERSION"),
+        " - raw offset read/write for removable devices"
+    )
 )]
 pub struct Cli {
     /// Print every device access step. Always printed on failure.
@@ -160,6 +164,14 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    /// A build handed over on a USB stick has no other way to say what it is.
+    #[test]
+    fn help_names_the_version_it_was_built_from() {
+        let help = Cli::command().render_long_help().to_string();
+
+        assert!(help.contains(env!("CARGO_PKG_VERSION")), "{help}");
+    }
 
     #[test]
     fn cli_definition_is_valid() {
