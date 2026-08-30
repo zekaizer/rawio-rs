@@ -17,6 +17,8 @@ use rawio_core::trace::Trace;
 struct FakeBackend {
     device: Rc<RefCell<MemoryDevice>>,
     volumes: Vec<VolumeLock>,
+    /// Access requested by every `open`, in order.
+    opens: RefCell<Vec<Access>>,
 }
 
 impl FakeBackend {
@@ -24,6 +26,7 @@ impl FakeBackend {
         Self {
             device: Rc::new(RefCell::new(MemoryDevice::new("mem0", size, removability))),
             volumes: Vec::new(),
+            opens: RefCell::new(Vec::new()),
         }
     }
 }
@@ -40,9 +43,10 @@ impl Backend for FakeBackend {
     fn open(
         &self,
         id: &str,
-        _access: Access,
+        access: Access,
         _trace: &Trace,
     ) -> Result<Box<dyn RawDevice>, DeviceError> {
+        self.opens.borrow_mut().push(access);
         if id != "mem0" {
             return Err(DeviceError::new(
                 Stage::Open,
@@ -555,6 +559,40 @@ fn a_dry_run_refuses_a_range_past_the_device_end() {
     assert!(
         matches!(result, Err(Error::InvalidArgument(_))),
         "{result:?}"
+    );
+}
+
+/// The Windows backend locks and dismounts mounted volumes on a writable open,
+/// so a rehearsal must never ask for one; only the real flash may.
+#[test]
+fn a_dry_run_flash_never_opens_the_device_for_writing() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    let input = tempdir("dryaccess").join("img.bin");
+    std::fs::write(&input, vec![0x5A; 4096]).unwrap();
+    let flash = |dry: bool| {
+        let mut args = vec![
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "0",
+            "-i",
+            input.to_str().unwrap(),
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (result, _) = run(&args, &backend);
+        assert!(result.is_ok(), "dry={dry}: {result:?}");
+    };
+
+    flash(true);
+    assert_eq!(*backend.opens.borrow(), vec![Access::Read]);
+
+    flash(false);
+    assert_eq!(
+        *backend.opens.borrow(),
+        vec![Access::Read, Access::ReadWrite]
     );
 }
 

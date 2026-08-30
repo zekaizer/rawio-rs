@@ -256,7 +256,14 @@ fn flash(
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::ReadWrite, trace)?;
+    // Opening for write is what locks and dismounts mounted volumes on
+    // Windows, and a rehearsal must do neither.
+    let access = if opts.dry_run {
+        Access::Read
+    } else {
+        Access::ReadWrite
+    };
+    let mut device = backend.open(&args.device, access, trace)?;
     transfer::ensure_writable(device.info())?;
 
     let input = longpath::for_open(&args.input);
