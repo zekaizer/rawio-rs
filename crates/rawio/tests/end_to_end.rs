@@ -1433,3 +1433,17 @@ fn show_adds_the_pit_when_asked() {
     assert!(with.contains("scheme=mbr"), "{with}");
     assert!(with.contains("LOG"), "{with}");
 }
+
+/// `show` names the device once. The table printers were standalone commands
+/// that each had to; now that show is their only caller, they must not.
+#[test]
+fn show_names_the_device_once() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let (result, out) = run(&["rawio", "show", "mem0", "--pit"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(out.matches("device: mem0").count(), 1, "{out}");
+}

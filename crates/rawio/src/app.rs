@@ -664,6 +664,8 @@ fn search_space(
 
 /// The scheme, where the entries came from, and every range they resolve to -
 /// the whole point of the command is that this is printable without acting.
+/// `show` has already named the device; `info` is here for the size the
+/// entries are checked against.
 fn print_parts(out: &mut dyn Write, table: &Table, info: &DeviceInfo) -> Result<()> {
     let io = |e| Error::io("writing output", e);
 
@@ -675,7 +677,6 @@ fn print_parts(out: &mut dyn Write, table: &Table, info: &DeviceInfo) -> Result<
         table.partitions.len()
     )
     .map_err(io)?;
-    writeln!(out, "device: {}", describe(info)).map_err(io)?;
     writeln!(out).map_err(io)?;
     writeln!(
         out,
@@ -739,7 +740,6 @@ fn print_table(out: &mut dyn Write, table: &Pit, at: u64, info: &DeviceInfo) -> 
         "pit: block size {ASSUMED_BLOCK_SIZE} assumed; every byte column below depends on it"
     )
     .map_err(io)?;
-    writeln!(out, "device: {}", describe(info)).map_err(io)?;
     writeln!(out).map_err(io)?;
     writeln!(
         out,
