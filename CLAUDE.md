@@ -19,7 +19,8 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - `src/trace.rs` — per-step device access log (`--trace`).
 - `src/device.rs` — `RawDevice` / `Backend` traits, `DeviceInfo`, in-memory test double.
 - `src/transfer.rs` — dump/flash over the traits: alignment, removable guard, partial-write reporting.
-- `src/pit.rs` — PIT header/entry parsing; read-only, opt-in.
+- `src/parts/` — MBR and GPT parsing and scheme detection; read-only.
+- `src/pit.rs` — PIT header/entry parsing and its search; read-only, opt-in.
 - `src/platform/` — OS backends. `windows/logic.rs` and `linux.rs` pure logic compiles on every host; only `windows/sys.rs` is `#[cfg(windows)]`.
 
 ## Rules
@@ -50,6 +51,12 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - Every command that acts on a range must be able to show what it resolved to
   without acting: `--dry-run` on dump, flash and verify, and `rawio pit` for the
   table. There are no interactive prompts to fall back on.
+- Scheme detection concludes only what a signature proves, and never lands on
+  the PIT. A card carrying both a real MBR and a GPT aborts asking for an
+  explicit `--scheme` rather than preferring one.
+- A PIT is searched for only in the space no partition covers, and the gap in
+  front of the first partition is searched backwards from that partition. The
+  budget exists because a full pass costs what reading the whole card costs.
 - The PIT layout is reverse engineered, not specified. Two sources agree on it
   (an XDA analysis and github.com/CruelKernel/samsung_pit), but no real card has
   been parsed yet. Keep it opt-in, keep printing the header and the resolved
