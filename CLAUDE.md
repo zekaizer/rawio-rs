@@ -37,7 +37,9 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
   the progress report tracks the medium; do not move back to a single flush at
   the end.
 - Results go to stdout, progress and diagnostics to stderr. A script reads
-  stdout, so nothing decorative may land there.
+  stdout, so nothing decorative may land there. How a range resolved - which
+  table, which entry, where a PIT search looked and what it found - explains a
+  result rather than being one, and goes to stderr with the rest.
 - No interactive prompts, ever. Every failure exits non-zero with the stage and
   the raw OS error code.
 - `flash` has no removable-check override. Do not add one.
@@ -52,15 +54,23 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 - Every command that acts on a range must be able to show what it resolved to
   without acting: `--dry-run` on hex, dump, flash and verify, and `rawio pit`
   for the table. There are no interactive prompts to fall back on.
+- A command that acts on a range is refused without one while it is still an
+  argument list. Opening for write locks and dismounts every volume on the
+  card, so a usage error must never get that far. `probe` is the only command
+  that may be handed a device and nothing else.
 - `rawio hex` is `hexdump -C` byte for byte, so its output diffs against the
   tool the reader already has. Its length defaults to one sector even when a
-  partition supplies the offset; a partition is never printed whole by default.
+  partition supplies the offset; a partition is never printed whole by default,
+  unless it is shorter than a sector and the whole of it is less.
 - Scheme detection concludes only what a signature proves, and never lands on
   the PIT. A card carrying both a real MBR and a GPT aborts asking for an
-  explicit `--scheme` rather than preferring one.
+  explicit `--scheme` rather than preferring one. `--pit-offset` says where a
+  PIT is and nothing more: only `--scheme` decides which table a range comes
+  from, because that decision also decides what `--partition-id` means.
 - A PIT is searched for only in the space no partition covers, and the gap in
   front of the first partition is searched backwards from that partition. The
-  budget exists because a full pass costs what reading the whole card costs.
+  budget exists because a full pass costs what reading the whole card costs, so
+  lifting it takes `--pit-scan all` and never a bare 0.
 - The PIT layout is reverse engineered, not specified. Two sources agree on it
   (an XDA analysis and github.com/CruelKernel/samsung_pit), but no real card has
   been parsed yet. Keep it opt-in, keep printing the header and the resolved
