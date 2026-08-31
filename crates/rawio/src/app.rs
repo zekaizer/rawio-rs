@@ -101,32 +101,59 @@ pub struct Range {
     pub length: Option<u64>,
 }
 
-pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
+/// `out` carries results, which a script reads. `diag` carries everything that
+/// only explains one: how a range was arrived at, and where a PIT was looked for.
+pub fn run(
+    cli: &Cli,
+    backend: &dyn Backend,
+    out: &mut dyn Write,
+    diag: &mut dyn Write,
+    trace: &Trace,
+) -> Result<()> {
     match &cli.command {
         Command::List => list(backend, out, trace),
-        Command::Probe(args) => probe(args, backend, out, trace, &Options::inspect(&args.table)),
-        Command::Parts(args) => {
-            parts_cmd(args, backend, out, trace, &Options::inspect(&args.table))
-        }
-        Command::Pit(args) => pit_cmd(args, backend, out, trace, &Options::pit(&args.pit_source)),
+        Command::Probe(args) => probe(
+            args,
+            backend,
+            out,
+            diag,
+            trace,
+            &Options::inspect(&args.table),
+        ),
+        Command::Parts(args) => parts_cmd(
+            args,
+            backend,
+            out,
+            diag,
+            trace,
+            &Options::inspect(&args.table),
+        ),
+        Command::Pit(args) => pit_cmd(
+            args,
+            backend,
+            out,
+            diag,
+            trace,
+            &Options::pit(&args.pit_source),
+        ),
         Command::Hex(args) => {
             let opts = Options {
                 dry_run: args.dry_run,
                 ..Options::inspect(&args.table)
             };
-            hex(args, backend, out, trace, &opts)
+            hex(args, backend, out, diag, trace, &opts)
         }
         Command::Dump(args) => {
             let opts = Options::transfer(&args.table, &args.transfer);
-            dump(args, backend, out, trace, &opts)
+            dump(args, backend, out, diag, trace, &opts)
         }
         Command::Flash(args) => {
             let opts = Options::transfer(&args.table, &args.transfer);
-            flash(args, backend, out, trace, &opts)
+            flash(args, backend, out, diag, trace, &opts)
         }
         Command::Verify(args) => {
             let opts = Options::transfer(&args.table, &args.transfer);
-            verify(args, backend, out, trace, &opts)
+            verify(args, backend, out, diag, trace, &opts)
         }
     }
 }
@@ -148,6 +175,7 @@ fn probe(
     args: &ProbeArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -169,12 +197,12 @@ fn probe(
     }
 
     if args.pit {
-        let found = locate_pit(&mut *device, out, trace, opts)?;
+        let found = locate_pit(&mut *device, diag, trace, opts)?;
         print_table(out, &found.pit, found.offset, &info)?;
     }
 
     if let Some(location) = args.location.given() {
-        let range = resolve(&mut *device, location, None, out, trace, opts)?;
+        let range = resolve(&mut *device, location, None, diag, trace, opts)?;
         writeln!(
             out,
             "resolved: offset={} length={:?}",
@@ -234,6 +262,7 @@ fn parts_cmd(
     args: &PartsArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -241,7 +270,7 @@ fn parts_cmd(
     let info = device.info().clone();
 
     if opts.source == Source::Pit {
-        let found = locate_pit(&mut *device, out, trace, opts)?;
+        let found = locate_pit(&mut *device, diag, trace, opts)?;
         return print_table(out, &found.pit, found.offset, &info);
     }
 
@@ -254,12 +283,13 @@ fn pit_cmd(
     args: &PitArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
     let mut device = backend.open(&args.device, Access::Read, trace)?;
     let info = device.info().clone();
-    let found = locate_pit(&mut *device, out, trace, opts)?;
+    let found = locate_pit(&mut *device, diag, trace, opts)?;
     print_table(out, &found.pit, found.offset, &info)
 }
 
@@ -269,6 +299,7 @@ fn hex(
     args: &HexArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -279,7 +310,7 @@ fn hex(
         &mut *device,
         &args.location,
         Some(args.length),
-        out,
+        diag,
         trace,
         opts,
     )?;
@@ -306,11 +337,12 @@ fn dump(
     args: &DumpArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, args.length, out, trace, opts)?;
+    let range = resolve(&mut *device, &args.location, args.length, diag, trace, opts)?;
     let length = range
         .length
         .ok_or_else(|| Error::InvalidArgument("--length is required with --offset".into()))?;
@@ -349,6 +381,7 @@ fn flash(
     args: &FlashArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -369,7 +402,7 @@ fn flash(
         .map_err(|e| Error::io(format!("stat {input:?}"), e))?
         .len();
 
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?;
+    let range = resolve(&mut *device, &args.location, None, diag, trace, opts)?;
     if let Some(limit) = range.length
         && input_len > limit
     {
@@ -426,6 +459,7 @@ fn verify(
     args: &VerifyArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -435,7 +469,7 @@ fn verify(
         .len();
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?;
+    let range = resolve(&mut *device, &args.location, None, diag, trace, opts)?;
     if let Some(limit) = range.length
         && length > limit
     {
@@ -480,7 +514,7 @@ fn resolve(
     device: &mut dyn RawDevice,
     location: &Location,
     explicit_length: Option<u64>,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<Range> {
@@ -500,11 +534,11 @@ fn resolve(
     };
 
     if opts.source != Source::Pit {
-        return resolve_in_table(device, selector, explicit_length, out, trace, opts);
+        return resolve_in_table(device, selector, explicit_length, diag, trace, opts);
     }
 
     let info = device.info().clone();
-    let table = locate_pit(device, out, trace, opts)?.pit;
+    let table = locate_pit(device, diag, trace, opts)?.pit;
     let partition = match selector {
         Selector::Name(name) => table.find(name)?,
         Selector::Id(id) => table.find_by_id(id)?,
@@ -513,7 +547,7 @@ fn resolve(
     let end = start.saturating_add(partition.byte_length());
 
     writeln!(
-        out,
+        diag,
         "pit: {} spans {start}..{end} ({} bytes) from block_offset={} block_count={} \
          device_type={} with block size {ASSUMED_BLOCK_SIZE} assumed",
         partition.name,
@@ -556,7 +590,7 @@ fn resolve_in_table(
     device: &mut dyn RawDevice,
     selector: Selector<'_>,
     explicit_length: Option<u64>,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<Range> {
@@ -568,7 +602,7 @@ fn resolve_in_table(
     };
 
     writeln!(
-        out,
+        diag,
         "parts: {} #{} {} spans {}..{} ({} bytes), type {}, from {}",
         table.scheme,
         partition.index,
@@ -621,7 +655,7 @@ fn read_table(device: &mut dyn RawDevice, opts: &Options, trace: &Trace) -> Resu
 /// wrong copy.
 fn locate_pit(
     device: &mut dyn RawDevice,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<Found> {
@@ -636,10 +670,10 @@ fn locate_pit(
         return Ok(Found { pit, offset: at });
     }
 
-    let gaps = search_space(device, out, trace)?;
+    let gaps = search_space(device, diag, trace)?;
     let found = pit::scan(&mut DeviceSectors::new(device, trace), &gaps, opts.pit_scan)?;
     writeln!(
-        out,
+        diag,
         "pit: found at offset {} by searching the space no partition covers",
         found.offset
     )
@@ -651,7 +685,7 @@ fn locate_pit(
 /// to speak of, so the whole of it is the search space.
 fn search_space(
     device: &mut dyn RawDevice,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
 ) -> Result<Vec<Gap>> {
     let size = device.info().size_bytes;
@@ -660,7 +694,7 @@ fn search_space(
         Ok(table) => table.gaps(size),
         Err(err) => {
             writeln!(
-                out,
+                diag,
                 "pit: no partition table to bound the search ({err}); searching from offset 0"
             )
             .map_err(|e| Error::io("writing output", e))?;
@@ -684,7 +718,7 @@ fn search_space(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    writeln!(out, "pit: searching {where_}").map_err(|e| Error::io("writing output", e))?;
+    writeln!(diag, "pit: searching {where_}").map_err(|e| Error::io("writing output", e))?;
     Ok(gaps)
 }
 

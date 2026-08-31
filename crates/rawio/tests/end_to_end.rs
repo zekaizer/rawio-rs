@@ -85,10 +85,27 @@ impl RawDevice for Handle {
 }
 
 fn run(args: &[&str], backend: &dyn Backend) -> (Result<(), Error>, String) {
+    let streams = run_streams(args, backend);
+    (streams.result, streams.out)
+}
+
+/// The two streams kept apart, for the tests that care which one a line took.
+struct Streams {
+    result: Result<(), Error>,
+    out: String,
+    diag: String,
+}
+
+fn run_streams(args: &[&str], backend: &dyn Backend) -> Streams {
     let cli = Cli::parse_from(args);
     let mut out = Vec::new();
-    let result = app::run(&cli, backend, &mut out, &Trace::new());
-    (result, String::from_utf8(out).expect("output is UTF-8"))
+    let mut diag = Vec::new();
+    let result = app::run(&cli, backend, &mut out, &mut diag, &Trace::new());
+    Streams {
+        result,
+        out: String::from_utf8(out).expect("output is UTF-8"),
+        diag: String::from_utf8(diag).expect("diagnostics are UTF-8"),
+    }
 }
 
 fn pit_image(entries: &[(&str, u32, u32)]) -> Vec<u8> {
@@ -191,7 +208,7 @@ fn partition_lookup_prints_the_resolved_range_before_use() {
 
     let dir = tempdir("pit");
     let output = dir.join("log.bin");
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "dump",
@@ -206,10 +223,11 @@ fn partition_lookup_prints_the_resolved_range_before_use() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
     assert!(
-        out.contains("pit: LOG spans 8192..12288 (4096 bytes)"),
-        "{out}"
+        run.diag.contains("pit: LOG spans 8192..12288 (4096 bytes)"),
+        "{}",
+        run.diag
     );
     assert_eq!(std::fs::read(&output).unwrap().len(), 4096);
 }
@@ -250,11 +268,15 @@ fn a_pit_in_front_of_the_first_partition_is_found_without_an_offset() {
     write_mbr(&backend, &[(0x0c, 2048, 4096)]);
     write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
 
-    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+    let run = run_streams(&["rawio", "pit", "mem0"], &backend);
 
-    assert!(result.is_ok(), "{result:?} {out}");
-    assert!(out.contains("pit: found at offset 1048064"), "{out}");
-    assert!(out.contains("LOG"), "{out}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(
+        run.diag.contains("pit: found at offset 1048064"),
+        "{}",
+        run.diag
+    );
+    assert!(run.out.contains("LOG"), "{}", run.out);
 }
 
 /// Two copies in the same gap: the one the partition was written against is
@@ -312,7 +334,7 @@ fn a_range_resolves_from_an_mbr_entry_by_index() {
     write_mbr(&backend, &[(0x0c, 2048, 8)]);
     let output = tempdir("mbr").join("p1.bin");
 
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "dump",
@@ -325,9 +347,9 @@ fn a_range_resolves_from_an_mbr_entry_by_index() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?} {out}");
-    assert!(out.contains("parts: mbr #1"), "{out}");
-    assert!(out.contains("spans 1048576..1052672"), "{out}");
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.diag.contains("spans 1048576..1052672"), "{}", run.diag);
     assert_eq!(std::fs::read(&output).unwrap().len(), 4096);
 }
 
@@ -433,7 +455,7 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
         &backend,
     );
     let by_id = dir.join("id.bin");
-    let (identified, out) = run(
+    let identified = run_streams(
         &[
             "rawio",
             "dump",
@@ -449,8 +471,12 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
     );
 
     assert!(named.is_ok(), "{named:?}");
-    assert!(identified.is_ok(), "{identified:?}");
-    assert!(out.contains("pit: LOG spans 32768..98304"), "{out}");
+    assert!(identified.result.is_ok(), "{:?}", identified.result);
+    assert!(
+        identified.diag.contains("pit: LOG spans 32768..98304"),
+        "{}",
+        identified.diag
+    );
     assert_eq!(
         std::fs::read(&by_name).unwrap(),
         std::fs::read(&by_id).unwrap()
@@ -1052,7 +1078,7 @@ fn hex_reads_the_partition_the_table_names() {
     write_mbr(&backend, &[(0x0c, 2048, 8)]);
     backend.device.borrow_mut().contents_mut()[1 << 20..(1 << 20) + 4].copy_from_slice(b"BOOT");
 
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "hex",
@@ -1065,9 +1091,9 @@ fn hex_reads_the_partition_the_table_names() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?}");
-    assert!(out.contains("parts: mbr #1"), "{out}");
-    assert!(out.contains("00100000  42 4f 4f 54"), "{out}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.out.contains("00100000  42 4f 4f 54"), "{}", run.out);
 }
 
 /// Most of a card is one repeated line, and printing all of them hides the one
@@ -1149,4 +1175,38 @@ fn hex_refuses_a_range_past_the_device_end() {
         matches!(result, Err(Error::InvalidArgument(_))),
         "{result:?}"
     );
+}
+
+/// A script reads stdout, and `rawio hex` exists to diff against the
+/// `hexdump -C` the reader already has. How the range was arrived at is for a
+/// person, so it takes stderr and leaves the dump alone.
+#[test]
+fn a_partition_hexdump_puts_nothing_but_the_dump_on_stdout() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+
+    let run = run_streams(&["rawio", "hex", "mem0", "--partition-id", "1"], &backend);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(run.out.starts_with("00100000"), "{}", run.out);
+    assert!(!run.out.contains("parts:"), "{}", run.out);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+}
+
+/// The same rule for the PIT: a search prints where it looked and what it
+/// found, and none of that belongs in what a script parses.
+#[test]
+fn a_pit_search_reports_itself_on_stderr() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let run = run_streams(&["rawio", "pit", "mem0"], &backend);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(!run.out.contains("pit: searching"), "{}", run.out);
+    assert!(!run.out.contains("pit: found at offset"), "{}", run.out);
+    assert!(run.diag.contains("pit: searching"), "{}", run.diag);
+    assert!(run.diag.contains("pit: found at offset"), "{}", run.diag);
+    assert!(run.out.contains("LOG"), "{}", run.out);
 }
