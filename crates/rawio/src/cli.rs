@@ -30,9 +30,10 @@ pub struct Cli {
 pub enum Command {
     /// List candidate devices.
     List,
-    /// Report everything needed to plan a transfer, without reading or writing.
+    /// Report everything needed to plan a transfer. Never writes.
     Probe(ProbeArgs),
-    /// Print the partition table the device carries. Reads only.
+    /// Print a partition table: the one the device carries, or the PIT under
+    /// --scheme pit. Reads only.
     Parts(PartsArgs),
     /// Print the PIT partition table. Reads only.
     Pit(PitArgs),
@@ -120,7 +121,8 @@ pub struct PitSource {
 /// The table a range is resolved from, for every command that resolves one.
 #[derive(Debug, Args)]
 pub struct TableSource {
-    /// Partition table to read: auto, mbr, gpt or pit.
+    /// Partition table a range comes from: auto, mbr, gpt, or pit for the
+    /// table `rawio pit` prints.
     #[arg(
         long,
         value_enum,
