@@ -9,7 +9,8 @@ Windows 11 and Linux from the same argument syntax.
 
 ```
 rawio list                                  # enumerate candidate devices
-rawio probe  <device> [--pit]               # non-destructive pre-flight report
+rawio probe  <device> [--parts] [--pit]     # non-destructive pre-flight report
+rawio parts  <device>                       # print the MBR or GPT the card carries
 rawio pit    <device>                       # print the PIT partition table
 rawio dump   <device> <target> --length N --output FILE
 rawio flash  <device> <target> --input FILE [--verify]
@@ -23,9 +24,9 @@ reads the final sector back first, so the bytes after the image survive.
 
 `--dry-run` resolves the target, prints what would happen, and stops without
 reading or writing the device. It is offered by `dump`, `flash` and `verify`
-and by nothing else; the same goes for `--no-progress`, and `--pit-offset` is
-offered only by the commands that can read a table. `--trace` is the one option
-every command takes.
+and by nothing else; the same goes for `--no-progress`, while `--scheme`,
+`--pit-offset` and `--pit-scan` are offered only by the commands that read a
+table. `--trace` is the one option every command takes.
 
 A progress line is drawn on stderr while a transfer runs, and only when stderr
 is a terminal, so a piped or redirected run stays quiet on its own. `--no-progress`
@@ -43,14 +44,56 @@ The last push is reported as a wait, because it is one.
 ## Targeting
 
 A target is one of `--offset N`, `--partition NAME`, or `--partition-id N`; they
-are mutually exclusive. The two partition forms read the PIT, which is otherwise
-never touched, and always print the range they resolved to before acting on it.
+are mutually exclusive. The two partition forms read a partition table, which is
+otherwise never touched, and always print the range they resolved to before
+acting on it.
 
-`rawio pit` prints the whole table, which is where the names and identifiers
+`--scheme` says which table that is:
+
+| `--scheme` | Table |
+|---|---|
+| `auto` (default) | whatever the card proves it has, MBR or GPT |
+| `mbr` | the MBR at LBA 0, including logical partitions on the EBR chain |
+| `gpt` | the GPT at LBA 1, or its backup at the last LBA |
+| `pit` | the Samsung PIT, wherever it is |
+
+`auto` concludes only what a signature proves. A protective entry means GPT; an
+MBR carrying real entries means MBR; a card carrying both is a hybrid layout and
+the run aborts asking for an explicit `--scheme`. It never lands on a PIT, whose
+location is an argument rather than a constant — `--scheme pit` or `--pit-offset`
+is what asks for one.
+
+`--partition NAME` matches a GPT name or a PIT name. MBR entries have no names,
+so there `--partition-id N` is the only selector, and it means the entry index —
+1 to 4 for primaries, 5 up for logical partitions, as Linux numbers them. Under
+a PIT it means the identifier instead.
+
+`rawio parts` prints the table and the space it leaves over:
+
+```
+parts: scheme=gpt, from primary GPT header at LBA 1, 2 entries
+device: \\.\PhysicalDrive2  29.7 GiB  removable  sector=512  Generic SD/MMC
+
+   ID  NAME                     TYPE                                            START         LENGTH       SIZE
+    1  boot                     c12a7328-f81f-11d2-ba4b-00a0c93ec93b          1048576      268435456  256.0 MiB
+    2  rootfs                   0fc63daf-8483-4772-8e79-3d69d8477de4        269484032    15568207872   14.5 GiB
+
+  unallocated 0..1048576 (1.0 MiB)  << a PIT search looks here first, backwards
+  unallocated 15837691904..15931539456 (89.5 MiB)
+```
+
+Partition types are printed as the table spells them — a hex byte under MBR, the
+type GUID under GPT — with no built-in name table to fall out of date. GPT is
+checked by CRC32 on both the header and the entry array, and falls back to the
+backup header, saying so when it does.
+
+## The PIT
+
+`rawio pit` prints the whole table, which is where its names and identifiers
 come from:
 
 ```
-pit: read at offset 0 - chip="EMMC16" port="COM4" format="FILE", 2 entries
+pit: read at offset 1048064 - chip="EMMC16" port="COM4" format="FILE", 2 entries
 pit: block size 512 assumed; every byte column below depends on it
 device: \\.\PhysicalDrive2  29.7 GiB  removable  sector=512  Generic SD/MMC
 
@@ -62,8 +105,23 @@ device: \\.\PhysicalDrive2  29.7 GiB  removable  sector=512  Generic SD/MMC
 The PIT layout is reverse engineered and its block size is assumed to be 512, so
 the byte columns can be plausible and still wrong. An entry that resolves past
 the end of the device is flagged, and a partition that resolves past the end
-aborts rather than transferring. `--pit-offset N` moves where the table is read
-from; the format does not fix its location.
+aborts rather than transferring.
+
+Nothing points at the PIT and its format does not fix where it lives, so without
+`--pit-offset N` it is searched for: the sectors no partition covers, taken from
+whichever table the card carries, with the space in front of the first partition
+read **backwards** — the sector immediately before that partition first, then the
+one before it. That is where the table sits on the card this was built for.
+
+```
+pit: searching 0..1048576 backwards, 15837691904..15931539456
+pit: found at offset 1048064 by searching the space no partition covers
+```
+
+A magic hit is only a candidate: the header is parsed, and one that does not
+parse is passed over. The search reads at most `--pit-scan` bytes, 64 MiB by
+default, because a full pass over a card costs what reading the card costs —
+64 GiB at 30 MB/s is over half an hour. `--pit-scan 0` lifts the cap.
 
 ## File paths
 
