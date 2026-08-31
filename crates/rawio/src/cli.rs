@@ -104,6 +104,10 @@ pub struct TableSource {
 /// What the range is, for every command that acts on one. The three forms are
 /// mutually exclusive, and the two partition forms are the only thing that
 /// makes a partition table be read at all.
+///
+/// The group is exclusive but not required: `probe` reports on the device
+/// itself and resolves a range only when it is given one. Every command that
+/// acts on a range wraps this in [`RequiredLocation`] instead.
 #[derive(Debug, Args)]
 #[group(required = false, multiple = false)]
 pub struct Location {
@@ -120,6 +124,35 @@ pub struct Location {
     /// the entry index under MBR and GPT, the identifier under a PIT.
     #[arg(long, value_name = "N", help_heading = "Target")]
     pub partition_id: Option<u32>,
+}
+
+impl Location {
+    /// `None` when the caller named no range at all, which only `probe` can do.
+    pub fn given(&self) -> Option<&Self> {
+        let named =
+            self.offset.is_some() || self.partition.is_some() || self.partition_id.is_some();
+        named.then_some(self)
+    }
+}
+
+/// The same three forms, one of which must be given. A command that opens the
+/// device to act on a range has to be refused while it is still an argument
+/// list: `flash` locks and dismounts every volume on the card the moment it
+/// opens for write, and a usage error must not cost that.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false, args = ["offset", "partition", "partition_id"])]
+pub struct RequiredLocation {
+    #[command(flatten)]
+    pub location: Location,
+}
+
+/// The wrapper carries no data of its own; only clap can tell the two apart.
+impl std::ops::Deref for RequiredLocation {
+    type Target = Location;
+
+    fn deref(&self) -> &Location {
+        &self.location
+    }
 }
 
 /// Settings shared by the commands that move or compare bytes, and offered by
@@ -187,7 +220,7 @@ pub struct HexArgs {
     pub device: String,
 
     #[command(flatten)]
-    pub location: Location,
+    pub location: RequiredLocation,
 
     #[command(flatten)]
     pub table: TableSource,
@@ -217,7 +250,7 @@ pub struct DumpArgs {
     pub device: String,
 
     #[command(flatten)]
-    pub location: Location,
+    pub location: RequiredLocation,
 
     #[command(flatten)]
     pub table: TableSource,
@@ -240,7 +273,7 @@ pub struct FlashArgs {
     pub device: String,
 
     #[command(flatten)]
-    pub location: Location,
+    pub location: RequiredLocation,
 
     #[command(flatten)]
     pub table: TableSource,
@@ -263,7 +296,7 @@ pub struct VerifyArgs {
     pub device: String,
 
     #[command(flatten)]
-    pub location: Location,
+    pub location: RequiredLocation,
 
     #[command(flatten)]
     pub table: TableSource,
@@ -620,6 +653,33 @@ mod tests {
             };
             assert_eq!(args.input, PathBuf::from(given), "{given}");
         }
+    }
+
+    /// A command that cannot act without a range has to be refused while it is
+    /// still an argument list: `flash` locks and dismounts every volume on the
+    /// card the moment it opens for write, and a usage error must not cost that.
+    #[test]
+    fn a_command_that_acts_on_a_range_is_given_one() {
+        for args in [
+            vec!["rawio", "hex", "d"],
+            vec!["rawio", "dump", "d", "-o", "x"],
+            vec!["rawio", "flash", "d", "-i", "x"],
+            vec!["rawio", "verify", "d", "-i", "x"],
+        ] {
+            let err = Cli::try_parse_from(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}"
+            );
+        }
+    }
+
+    /// `probe` reports on the device itself, so it has nothing it must be told.
+    #[test]
+    fn probe_needs_no_range() {
+        assert!(Cli::try_parse_from(["rawio", "probe", "d"]).is_ok());
+        assert!(Cli::try_parse_from(["rawio", "probe", "d", "--parts"]).is_ok());
     }
 
     /// There must be no way to ask for the removable check to be skipped.

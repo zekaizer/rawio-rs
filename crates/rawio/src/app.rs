@@ -173,7 +173,8 @@ fn probe(
         print_table(out, &found.pit, found.offset, &info)?;
     }
 
-    if let Some(range) = resolve(&mut *device, &args.location, None, out, trace, opts)? {
+    if let Some(location) = args.location.given() {
+        let range = resolve(&mut *device, location, None, out, trace, opts)?;
         writeln!(
             out,
             "resolved: offset={} length={:?}",
@@ -281,8 +282,7 @@ fn hex(
         out,
         trace,
         opts,
-    )?
-    .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    )?;
     let length = range.length.unwrap_or(args.length);
 
     let end = transfer::check_read_range(device.info(), range.offset, length)?;
@@ -310,8 +310,7 @@ fn dump(
     opts: &Options,
 ) -> Result<()> {
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, args.length, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, args.length, out, trace, opts)?;
     let length = range
         .length
         .ok_or_else(|| Error::InvalidArgument("--length is required with --offset".into()))?;
@@ -370,8 +369,7 @@ fn flash(
         .map_err(|e| Error::io(format!("stat {input:?}"), e))?
         .len();
 
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?;
     if let Some(limit) = range.length
         && input_len > limit
     {
@@ -437,8 +435,7 @@ fn verify(
         .len();
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?;
     if let Some(limit) = range.length
         && length > limit
     {
@@ -486,20 +483,24 @@ fn resolve(
     out: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
-) -> Result<Option<Range>> {
+) -> Result<Range> {
     let selector = match (&location.partition, location.partition_id) {
         (Some(name), _) => Selector::Name(name),
         (None, Some(id)) => Selector::Id(id),
+        // The location group is required and exclusive, so this is the offset form.
         (None, None) => {
-            return Ok(location.offset.map(|offset| Range {
+            let offset = location
+                .offset
+                .expect("the location group admits nothing else");
+            return Ok(Range {
                 offset,
                 length: explicit_length,
-            }));
+            });
         }
     };
 
     if opts.source != Source::Pit {
-        return resolve_in_table(device, selector, explicit_length, out, trace, opts).map(Some);
+        return resolve_in_table(device, selector, explicit_length, out, trace, opts);
     }
 
     let info = device.info().clone();
@@ -543,10 +544,10 @@ fn resolve(
         )));
     }
 
-    Ok(Some(Range {
+    Ok(Range {
         offset: start,
         length: Some(length),
-    }))
+    })
 }
 
 /// Resolves a range from the MBR or GPT, printing what it resolved to and
