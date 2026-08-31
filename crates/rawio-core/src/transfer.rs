@@ -104,6 +104,67 @@ pub fn check_range(info: &DeviceInfo, offset: u64, length: u64) -> Result<u64> {
     Ok(end)
 }
 
+/// What a read that only looks proves before it touches the device. Unlike a
+/// transfer the offset need not be sector aligned: the sector the range starts
+/// in is read whole and its head discarded, which is what lets an inspection
+/// look at a structure that does not begin on a sector. Returns the exclusive
+/// end of the range.
+pub fn check_read_range(info: &DeviceInfo, offset: u64, length: u64) -> Result<u64> {
+    require_usable_sector(info)?;
+    let sector = u64::from(info.logical_sector_size);
+    let overflow =
+        || Error::InvalidArgument(format!("offset {offset} + length {length} overflows"));
+    let end = offset.checked_add(length).ok_or_else(overflow)?;
+    // The last sector is read whole, so it is the aligned end that has to fit.
+    let aligned = end.checked_next_multiple_of(sector).ok_or_else(overflow)?;
+    if let Some(size) = info.size_bytes
+        && aligned > size
+    {
+        return Err(Error::InvalidArgument(format!(
+            "range {offset}+{length} exceeds device size {size}"
+        )));
+    }
+    Ok(end)
+}
+
+/// Reads `length` bytes from `offset` and hands them to `sink` in chunks, each
+/// with the device offset it starts at. Returns the number of bytes handed over.
+pub fn read_range(
+    device: &mut dyn RawDevice,
+    offset: u64,
+    length: u64,
+    trace: &Trace,
+    sink: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+) -> Result<u64> {
+    check_read_range(device.info(), offset, length)?;
+    let sector = device.info().logical_sector_size;
+    let stride = u64::from(sector);
+    // One sector of the buffer belongs to the head that gets discarded, so a
+    // full chunk of wanted bytes still fits after the aligned read grows.
+    let span = CHUNK as u64 - stride;
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+
+    while done < length {
+        let at = offset + done;
+        let start = at - at % stride;
+        let head = (at - start) as usize;
+        let want = usize::try_from((length - done).min(span)).unwrap_or(CHUNK - head);
+        let aligned =
+            usize::try_from(align_up((head + want) as u64, sector)).unwrap_or_else(|_| head + want);
+
+        device.read_at(start, &mut buf[..aligned]).map_err(|err| {
+            trace.failed(format!("read {aligned}B at {start}"), &err);
+            Error::Device(err)
+        })?;
+        trace.ok(Stage::Read, format!("read {aligned}B at {start}"), "ok");
+
+        sink(at, &buf[head..head + want])?;
+        done += want as u64;
+    }
+    Ok(done)
+}
+
 /// Returns the number of bytes written to `sink`.
 pub fn dump(
     device: &mut dyn RawDevice,
@@ -727,5 +788,84 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    /// An inspection has to be able to start where a structure starts, not
+    /// where the sector does.
+    #[test]
+    fn a_read_range_starts_where_it_was_asked_to_start() {
+        let mut device = MemoryDevice::new("mem0", 8192, Removability::Removable);
+        let data = pattern(8192);
+        device.contents_mut().copy_from_slice(&data);
+
+        let mut seen = Vec::new();
+        let mut at = Vec::new();
+        let n = read_range(
+            &mut device,
+            100,
+            300,
+            &Trace::new(),
+            &mut |offset, bytes| {
+                at.push(offset);
+                seen.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(n, 300);
+        assert_eq!(at, vec![100]);
+        assert_eq!(seen, data[100..400]);
+    }
+
+    /// A range longer than one chunk arrives in order and unbroken, with each
+    /// piece labelled by the offset it really came from.
+    #[test]
+    fn a_read_range_longer_than_a_chunk_arrives_in_order() {
+        let size = 3 * CHUNK;
+        let mut device = MemoryDevice::new("mem0", size, Removability::Removable);
+        let data = pattern(size);
+        device.contents_mut().copy_from_slice(&data);
+
+        let want = 2 * CHUNK as u64 + 4096;
+        let mut seen = Vec::new();
+        let mut next = 512u64;
+        let n = read_range(
+            &mut device,
+            512,
+            want,
+            &Trace::new(),
+            &mut |offset, bytes| {
+                assert_eq!(offset, next, "chunks arrive at consecutive offsets");
+                next += bytes.len() as u64;
+                seen.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(n, want);
+        assert_eq!(seen, data[512..512 + want as usize]);
+    }
+
+    #[test]
+    fn a_read_range_past_the_device_end_is_refused_before_any_read() {
+        let mut device = MemoryDevice::new("mem0", 4096, Removability::Removable);
+        device.fail_reads_from(0);
+
+        let err =
+            read_range(&mut device, 3900, 512, &Trace::new(), &mut |_, _| Ok(())).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    }
+
+    /// The rehearsal has to approve exactly what the real read would, including
+    /// the unaligned start a transfer refuses.
+    #[test]
+    fn the_read_check_accepts_an_unaligned_offset_and_reports_the_end() {
+        let device = MemoryDevice::new("mem0", 4096, Removability::Removable);
+
+        assert_eq!(check_read_range(device.info(), 100, 300).unwrap(), 400);
+        assert!(check_read_range(device.info(), 3900, 512).is_err());
     }
 }
