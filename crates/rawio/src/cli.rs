@@ -244,7 +244,8 @@ pub struct PitArgs {
 
 /// What a hexdump prints when no length is given: one 512-byte sector, which is
 /// what the structures a hexdump gets opened for live in. A partition form
-/// supplies the offset, never a length that could be the whole card.
+/// supplies the offset, never a length that could be the whole card, and an
+/// entry shorter than this is printed whole.
 pub const DEFAULT_HEX_LENGTH: u64 = 512;
 
 #[derive(Debug, Args)]
@@ -258,15 +259,15 @@ pub struct HexArgs {
     #[command(flatten)]
     pub table: TableSource,
 
-    /// Bytes to print. The offset need not start on a sector.
+    /// Bytes to print. The offset need not start on a sector. Defaults to one
+    /// 512-byte sector, or to the whole partition where that is smaller.
     #[arg(
         long,
         value_parser = parse_size,
         value_name = "N",
-        default_value_t = DEFAULT_HEX_LENGTH,
         help_heading = "Target"
     )]
-    pub length: u64,
+    pub length: Option<u64>,
 
     /// Print every line, including the runs of identical ones a `*` stands for.
     #[arg(long)]
@@ -597,7 +598,7 @@ mod tests {
             panic!("expected hex")
         };
 
-        assert_eq!(args.length, DEFAULT_HEX_LENGTH);
+        assert_eq!(args.length, None);
         assert!(!args.no_squeeze);
     }
 

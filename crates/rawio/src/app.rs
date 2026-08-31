@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::cli::{
-    Cli, Command, DumpArgs, FlashArgs, HexArgs, Location, PartsArgs, PitArgs, PitSource, ProbeArgs,
-    SchemeArg, TableSource, TransferOptions, VerifyArgs,
+    Cli, Command, DEFAULT_HEX_LENGTH, DumpArgs, FlashArgs, HexArgs, Location, PartsArgs, PitArgs,
+    PitSource, ProbeArgs, SchemeArg, TableSource, TransferOptions, VerifyArgs,
 };
 use crate::hexdump::Hexdump;
 use crate::longpath;
@@ -314,15 +314,14 @@ fn hex(
     let io = |e| Error::io("writing output", e);
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(
-        &mut *device,
-        &args.location,
-        Some(args.length),
-        diag,
-        trace,
-        opts,
-    )?;
-    let length = range.length.unwrap_or(args.length);
+    let range = resolve(&mut *device, &args.location, args.length, diag, trace, opts)?;
+    // A partition shorter than a sector is printed whole; a length the caller
+    // typed is theirs, and was checked against the partition as it resolved.
+    let length = args.length.unwrap_or_else(|| {
+        range
+            .length
+            .map_or(DEFAULT_HEX_LENGTH, |whole| whole.min(DEFAULT_HEX_LENGTH))
+    });
 
     let end = transfer::check_read_range(device.info(), range.offset, length)?;
     if opts.dry_run {

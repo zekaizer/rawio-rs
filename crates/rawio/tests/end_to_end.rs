@@ -1275,3 +1275,58 @@ fn probe_takes_a_pit_offset_alongside_the_partition_table() {
     assert!(run.out.contains("resolved: offset=1048576"), "{}", run.out);
     assert!(run.out.contains("LOG"), "{}", run.out);
 }
+
+/// The default length is what the tool chose, not what the caller asked for.
+/// An entry smaller than a sector is printed whole rather than refused for
+/// exceeding a --length nobody typed.
+#[test]
+fn a_default_hex_length_yields_to_a_smaller_partition() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("TINY", 16, 0)]);
+
+    let run = run_streams(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "0",
+            "--partition",
+            "TINY",
+        ],
+        &backend,
+    );
+
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    assert_eq!(run.out, "00002000\n");
+}
+
+/// A length the caller did type is still checked against the partition, and
+/// the message names the flag they typed.
+#[test]
+fn a_hex_length_past_the_end_of_the_partition_is_refused() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("LOG", 16, 1)]);
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "0",
+            "--partition",
+            "LOG",
+            "--length",
+            "1K",
+        ],
+        &backend,
+    );
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("--length 1024"), "{message}");
+}
