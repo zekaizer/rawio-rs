@@ -16,6 +16,7 @@ pub enum Stage {
     Write,
     Flush,
     ParsePit,
+    ParseParts,
 }
 
 impl Stage {
@@ -30,6 +31,7 @@ impl Stage {
             Stage::Write => "write",
             Stage::Flush => "flush",
             Stage::ParsePit => "parse-pit",
+            Stage::ParseParts => "parse-partitions",
         }
     }
 }
@@ -114,6 +116,9 @@ pub enum Error {
     #[error("PIT: {0}")]
     Pit(String),
 
+    #[error("partition table: {0}")]
+    Parts(String),
+
     /// The device is left partially written; `written` bytes landed at `start`.
     #[error("write aborted after {written} bytes written at offset {start}: {source}")]
     WriteAborted {
@@ -152,7 +157,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Error::InvalidArgument(_) => 2,
-            Error::Device(_) | Error::Io { .. } | Error::Pit(_) => 3,
+            Error::Device(_) | Error::Io { .. } | Error::Pit(_) | Error::Parts(_) => 3,
             Error::NotRemovable { .. } => 4,
             Error::WriteAborted { .. } => 5,
             Error::Unsupported(_) => 6,

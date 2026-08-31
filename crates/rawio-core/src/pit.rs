@@ -19,6 +19,7 @@
 //! caller must print the resolved range before acting on it.
 
 use crate::error::{Error, Result};
+use crate::parts::{Gap, MAX_READ_BYTES, Sectors};
 
 pub const MAGIC: u32 = 0x1234_9876;
 pub const HEADER_LEN: usize = 28;
@@ -27,6 +28,12 @@ pub const ENTRY_LEN: usize = 132;
 /// Entry counts above this are treated as garbage rather than sized for; real
 /// tables hold a few dozen entries.
 pub const MAX_ENTRIES: usize = 4096;
+
+/// How much unallocated space a search reads before giving up. The table sits
+/// in front of the first partition on every card seen so far, and that gap is
+/// searched backwards, so the default is reached only when it is somewhere
+/// else entirely.
+pub const DEFAULT_SCAN_BUDGET: u64 = 64 << 20;
 
 /// The unit of `block_offset`/`block_count` is undocumented. 512 is an assumption;
 /// comparing a resolved range against an explicit-offset run is what disproves it.
@@ -181,6 +188,98 @@ impl Pit {
     }
 }
 
+/// A table and the offset it was found at. The offset is printed before
+/// anything acts on a range, because a search that landed on the wrong copy is
+/// only visible there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub pit: Pit,
+    pub offset: u64,
+}
+
+/// Two-phase read at a known offset: the header is validated before its entry
+/// count is allowed to size the read that follows it.
+pub fn read_at(src: &mut dyn Sectors, offset: u64) -> Result<Pit> {
+    let sector = u64::from(src.sector_size());
+    if sector == 0 || offset % sector != 0 {
+        return Err(Error::Pit(format!(
+            "offset {offset} is not a multiple of the {sector}-byte sector size"
+        )));
+    }
+    let lba = offset / sector;
+
+    let head = src.read(lba, (HEADER_LEN as u64).div_ceil(sector).max(1))?;
+    let needed = Pit::table_len(&head)?;
+    if needed <= head.len() {
+        return Pit::parse(&head);
+    }
+
+    let whole = src.read(lba, (needed as u64).div_ceil(sector))?;
+    Pit::parse(&whole)
+}
+
+/// Searches the space no partition covers for the table's magic.
+///
+/// The magic alone proves nothing - four bytes come up by chance - so every hit
+/// is parsed, and one that does not parse is passed over rather than reported.
+/// `budget` caps the bytes read; 0 lifts the cap. A full pass over a large card
+/// is bounded by read throughput, not by this loop, which is why the cap exists.
+pub fn scan(src: &mut dyn Sectors, gaps: &[Gap], budget: u64) -> Result<Found> {
+    let sector = u64::from(src.sector_size());
+    if sector == 0 {
+        return Err(Error::Pit("the device reports a zero sector size".into()));
+    }
+    let mut left = if budget == 0 { u64::MAX } else { budget };
+    let mut read = 0u64;
+
+    for gap in gaps {
+        let start = gap.start.div_ceil(sector) * sector;
+        let end = gap.end / sector * sector;
+        if end <= start {
+            continue;
+        }
+        let mut at = if gap.reverse { end } else { start };
+
+        while left >= sector && (if gap.reverse { at > start } else { at < end }) {
+            let room = if gap.reverse { at - start } else { end - at };
+            let len = room.min(MAX_READ_BYTES).min(left) / sector * sector;
+            let from = if gap.reverse { at - len } else { at };
+
+            let buf = src.read(from / sector, len / sector)?;
+            read += len;
+            left -= len;
+
+            let hits = (0..buf.len() / sector as usize).map(|i| i * sector as usize);
+            let ordered: Vec<usize> = if gap.reverse {
+                hits.rev().collect()
+            } else {
+                hits.collect()
+            };
+            for i in ordered {
+                if u32::from_le_bytes(buf[i..i + 4].try_into().expect("4 bytes")) != MAGIC {
+                    continue;
+                }
+                let offset = from + i as u64;
+                if let Ok(pit) = read_at(src, offset) {
+                    return Ok(Found { pit, offset });
+                }
+            }
+
+            at = if gap.reverse { from } else { at + len };
+        }
+    }
+
+    let looked = gaps
+        .iter()
+        .map(|gap| format!("{}..{}", gap.start, gap.end))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::Pit(format!(
+        "no PIT found in {read} bytes of the space no partition covers ({looked}); \
+         pass --pit-offset if the table is elsewhere, or --pit-scan to search further"
+    )))
+}
+
 fn parse_entry(entry: &[u8], index: usize) -> Result<Partition> {
     let name = name_at(entry, 36)
         .ok_or_else(|| Error::Pit(format!("entry {index} has a non-UTF-8 name")))?;
@@ -222,6 +321,119 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::parts::{ImageSectors, Table, mbr::tests::write_table};
+
+    const SECTOR: u64 = 512;
+    /// The card in hand: one MBR partition, the table tucked into the space in
+    /// front of it.
+    const FIRST_PARTITION_LBA: u32 = 2048;
+
+    /// An MBR-partitioned card with `pits` written at the given byte offsets.
+    fn card_with_pits(pits: &[u64]) -> (ImageSectors, Vec<Gap>) {
+        let size = 16 << 20;
+        let mut data = vec![0u8; size];
+        write_table(&mut data, 0, &[(0x0c, FIRST_PARTITION_LBA, 4096)]);
+        let table = build(&[("BOOT", 2048, 128), ("LOG", 8192, 1024)]);
+        for at in pits {
+            let at = *at as usize;
+            data[at..at + table.len()].copy_from_slice(&table);
+        }
+        let mut image = ImageSectors::new(data, SECTOR as u32);
+        let parsed = crate::parts::read(&mut image, None).unwrap();
+        let gaps = parsed.gaps(Some(size as u64));
+        (image, gaps)
+    }
+
+    #[test]
+    fn a_table_in_the_unallocated_space_is_found_by_its_magic() {
+        let (mut image, gaps) = card_with_pits(&[1000 * SECTOR]);
+
+        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+
+        assert_eq!(found.offset, 1000 * SECTOR);
+        assert_eq!(found.pit.partitions.len(), 2);
+    }
+
+    /// The gap in front of the first partition is searched backwards, so the
+    /// copy the partition was written against is the one that answers.
+    #[test]
+    fn the_copy_nearest_the_first_partition_answers_first() {
+        let (mut image, gaps) = card_with_pits(&[100 * SECTOR, 2000 * SECTOR]);
+
+        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+
+        assert_eq!(found.offset, 2000 * SECTOR);
+    }
+
+    /// Four bytes come up by chance; only a parse settles it.
+    #[test]
+    fn a_stray_magic_is_passed_over() {
+        let (mut image, gaps) = card_with_pits(&[1000 * SECTOR]);
+        let stray = 1500 * SECTOR as usize;
+        image.data_mut()[stray..stray + 4].copy_from_slice(&MAGIC.to_le_bytes());
+        image.data_mut()[stray + 4..stray + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+
+        assert_eq!(found.offset, 1000 * SECTOR);
+    }
+
+    /// A full pass over a card is bounded by read throughput, so the search has
+    /// to stop somewhere and say how to carry on.
+    #[test]
+    fn the_budget_bounds_the_search_and_the_message_says_what_to_do() {
+        let (mut image, gaps) = card_with_pits(&[8 << 20]);
+
+        let err = scan(&mut image, &gaps, 4096).unwrap_err().to_string();
+
+        assert!(err.contains("--pit-offset"), "{err}");
+        assert!(err.contains("--pit-scan"), "{err}");
+    }
+
+    #[test]
+    fn an_unlimited_budget_reaches_the_tail() {
+        let (mut image, gaps) = card_with_pits(&[8 << 20]);
+
+        assert_eq!(scan(&mut image, &gaps, 0).unwrap().offset, 8 << 20);
+    }
+
+    /// Every read this tool makes is sector aligned; an offset that is not is a
+    /// wrong argument, not a read to attempt.
+    #[test]
+    fn read_at_refuses_an_unaligned_offset() {
+        let (mut image, _) = card_with_pits(&[1000 * SECTOR]);
+
+        let err = read_at(&mut image, 1000 * SECTOR + 1)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("sector size"), "{err}");
+    }
+
+    #[test]
+    fn read_at_reads_a_table_longer_than_one_sector() {
+        let (mut image, _) = card_with_pits(&[1000 * SECTOR]);
+
+        let pit = read_at(&mut image, 1000 * SECTOR).unwrap();
+
+        assert_eq!(pit.partitions.len(), 2);
+        assert!(HEADER_LEN + 2 * ENTRY_LEN > SECTOR as usize / 2);
+    }
+
+    /// A search over a device with no table at all must not report one.
+    #[test]
+    fn an_empty_card_finds_nothing() {
+        let mut image = ImageSectors::new(vec![0u8; 1 << 20], SECTOR as u32);
+        let gaps = Table {
+            scheme: crate::parts::Scheme::Mbr,
+            source: "test".into(),
+            partitions: Vec::new(),
+        }
+        .gaps(Some(1 << 20));
+
+        assert!(scan(&mut image, &gaps, 0).is_err());
+    }
 
     fn build(entries: &[(&str, u32, u32)]) -> Vec<u8> {
         let mut buf = vec![0u8; HEADER_LEN + entries.len() * ENTRY_LEN];
