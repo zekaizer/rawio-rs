@@ -58,6 +58,37 @@ pub enum SchemeArg {
     Pit,
 }
 
+/// Bytes the PIT search may read, or no cap at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBudget(Option<u64>);
+
+impl ScanBudget {
+    pub fn bytes(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ScanBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(bytes) => write!(f, "{bytes}"),
+            None => f.write_str("all"),
+        }
+    }
+}
+
+/// Accepts what [`parse_size`] does, plus `all` for no cap. A budget of zero
+/// reads nothing, so it is refused rather than read as either one.
+pub fn parse_scan_budget(value: &str) -> Result<ScanBudget, String> {
+    if value.trim().eq_ignore_ascii_case("all") {
+        return Ok(ScanBudget(None));
+    }
+    match parse_size(value)? {
+        0 => Err("a scan budget of 0 reads nothing; pass `all` to lift the cap".into()),
+        bytes => Ok(ScanBudget(Some(bytes))),
+    }
+}
+
 /// Where to read the PIT from, for the commands that can read one.
 #[derive(Debug, Args)]
 pub struct PitSource {
@@ -73,17 +104,17 @@ pub struct PitSource {
     )]
     pub pit_offset: Option<u64>,
 
-    /// Bytes of unallocated space the search may read before it gives up.
-    /// 0 lifts the cap; a full pass over a large card takes as long as
+    /// Bytes of unallocated space the search may read before it gives up, or
+    /// `all` to lift the cap. A full pass over a large card takes as long as
     /// reading one.
     #[arg(
         long,
-        value_name = "N",
-        value_parser = parse_size,
-        default_value_t = DEFAULT_SCAN_BUDGET,
+        value_name = "N|all",
+        value_parser = parse_scan_budget,
+        default_value_t = ScanBudget(Some(DEFAULT_SCAN_BUDGET)),
         help_heading = "Target"
     )]
-    pub pit_scan: u64,
+    pub pit_scan: ScanBudget,
 }
 
 /// The table a range is resolved from, for every command that resolves one.
@@ -399,7 +430,7 @@ mod tests {
     fn the_options_that_do_something_are_still_there() {
         let somewhere = [
             vec!["rawio", "pit", "d", "--pit-offset", "4K"],
-            vec!["rawio", "pit", "d", "--pit-scan", "0"],
+            vec!["rawio", "pit", "d", "--pit-scan", "all"],
             vec!["rawio", "parts", "d"],
             vec!["rawio", "parts", "d", "--scheme", "gpt"],
             vec!["rawio", "probe", "d", "--parts"],
@@ -523,7 +554,10 @@ mod tests {
 
         assert_eq!(args.table.scheme, SchemeArg::Auto);
         assert_eq!(args.table.pit_source.pit_offset, None);
-        assert_eq!(args.table.pit_source.pit_scan, DEFAULT_SCAN_BUDGET);
+        assert_eq!(
+            args.table.pit_source.pit_scan.bytes(),
+            Some(DEFAULT_SCAN_BUDGET)
+        );
     }
 
     #[test]
@@ -682,6 +716,15 @@ mod tests {
     fn probe_needs_no_range() {
         assert!(Cli::try_parse_from(["rawio", "probe", "d"]).is_ok());
         assert!(Cli::try_parse_from(["rawio", "probe", "d", "--parts"]).is_ok());
+    }
+
+    /// A budget of 0 meaning "no budget" is one keystroke from 0 meaning "read
+    /// nothing", and the wrong reading costs a full pass over the card.
+    #[test]
+    fn an_unlimited_scan_is_spelled_out() {
+        assert_eq!(parse_scan_budget("all").unwrap().bytes(), None);
+        assert_eq!(parse_scan_budget("4K").unwrap().bytes(), Some(4096));
+        assert!(parse_scan_budget("0").is_err());
     }
 
     /// There must be no way to ask for the removable check to be skipped.

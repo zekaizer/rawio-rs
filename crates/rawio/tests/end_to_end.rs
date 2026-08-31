@@ -305,7 +305,7 @@ fn the_search_stops_at_the_budget_and_says_how_to_carry_on() {
     let message = stopped.unwrap_err().to_string();
     assert!(message.contains("--pit-scan"), "{message}");
 
-    let (found, out) = run(&["rawio", "pit", "mem0", "--pit-scan", "0"], &backend);
+    let (found, out) = run(&["rawio", "pit", "mem0", "--pit-scan", "all"], &backend);
     assert!(found.is_ok(), "{found:?}");
     assert!(out.contains("LOG"), "{out}");
 }

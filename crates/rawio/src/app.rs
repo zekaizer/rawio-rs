@@ -34,7 +34,7 @@ enum Source {
 struct Options {
     source: Source,
     pit_at: Option<u64>,
-    pit_scan: u64,
+    pit_scan: Option<u64>,
     dry_run: bool,
     progress: bool,
 }
@@ -69,7 +69,7 @@ impl Options {
         Ok(Self {
             source,
             pit_at: table.pit_source.pit_offset,
-            pit_scan: table.pit_source.pit_scan,
+            pit_scan: table.pit_source.pit_scan.bytes(),
             dry_run: false,
             progress: false,
         })
@@ -80,7 +80,7 @@ impl Options {
         Self {
             source: Source::Pit,
             pit_at: pit.pit_offset,
-            pit_scan: pit.pit_scan,
+            pit_scan: pit.pit_scan.bytes(),
             dry_run: false,
             progress: false,
         }
