@@ -222,14 +222,15 @@ pub fn read_at(src: &mut dyn Sectors, offset: u64) -> Result<Pit> {
 ///
 /// The magic alone proves nothing - four bytes come up by chance - so every hit
 /// is parsed, and one that does not parse is passed over rather than reported.
-/// `budget` caps the bytes read; 0 lifts the cap. A full pass over a large card
-/// is bounded by read throughput, not by this loop, which is why the cap exists.
-pub fn scan(src: &mut dyn Sectors, gaps: &[Gap], budget: u64) -> Result<Found> {
+/// `budget` caps the bytes read; `None` lifts the cap. A full pass over a large
+/// card is bounded by read throughput, not by this loop, which is why the cap
+/// exists.
+pub fn scan(src: &mut dyn Sectors, gaps: &[Gap], budget: Option<u64>) -> Result<Found> {
     let sector = u64::from(src.sector_size());
     if sector == 0 {
         return Err(Error::Pit("the device reports a zero sector size".into()));
     }
-    let mut left = if budget == 0 { u64::MAX } else { budget };
+    let mut left = budget.unwrap_or(u64::MAX);
     let mut read = 0u64;
 
     for gap in gaps {
@@ -349,7 +350,7 @@ mod tests {
     fn a_table_in_the_unallocated_space_is_found_by_its_magic() {
         let (mut image, gaps) = card_with_pits(&[1000 * SECTOR]);
 
-        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+        let found = scan(&mut image, &gaps, Some(DEFAULT_SCAN_BUDGET)).unwrap();
 
         assert_eq!(found.offset, 1000 * SECTOR);
         assert_eq!(found.pit.partitions.len(), 2);
@@ -361,7 +362,7 @@ mod tests {
     fn the_copy_nearest_the_first_partition_answers_first() {
         let (mut image, gaps) = card_with_pits(&[100 * SECTOR, 2000 * SECTOR]);
 
-        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+        let found = scan(&mut image, &gaps, Some(DEFAULT_SCAN_BUDGET)).unwrap();
 
         assert_eq!(found.offset, 2000 * SECTOR);
     }
@@ -374,7 +375,7 @@ mod tests {
         image.data_mut()[stray..stray + 4].copy_from_slice(&MAGIC.to_le_bytes());
         image.data_mut()[stray + 4..stray + 8].copy_from_slice(&u32::MAX.to_le_bytes());
 
-        let found = scan(&mut image, &gaps, DEFAULT_SCAN_BUDGET).unwrap();
+        let found = scan(&mut image, &gaps, Some(DEFAULT_SCAN_BUDGET)).unwrap();
 
         assert_eq!(found.offset, 1000 * SECTOR);
     }
@@ -385,7 +386,7 @@ mod tests {
     fn the_budget_bounds_the_search_and_the_message_says_what_to_do() {
         let (mut image, gaps) = card_with_pits(&[8 << 20]);
 
-        let err = scan(&mut image, &gaps, 4096).unwrap_err().to_string();
+        let err = scan(&mut image, &gaps, Some(4096)).unwrap_err().to_string();
 
         assert!(err.contains("--pit-offset"), "{err}");
         assert!(err.contains("--pit-scan"), "{err}");
@@ -395,7 +396,7 @@ mod tests {
     fn an_unlimited_budget_reaches_the_tail() {
         let (mut image, gaps) = card_with_pits(&[8 << 20]);
 
-        assert_eq!(scan(&mut image, &gaps, 0).unwrap().offset, 8 << 20);
+        assert_eq!(scan(&mut image, &gaps, None).unwrap().offset, 8 << 20);
     }
 
     /// Every read this tool makes is sector aligned; an offset that is not is a
@@ -432,7 +433,7 @@ mod tests {
         }
         .gaps(Some(1 << 20));
 
-        assert!(scan(&mut image, &gaps, 0).is_err());
+        assert!(scan(&mut image, &gaps, None).is_err());
     }
 
     fn build(entries: &[(&str, u32, u32)]) -> Vec<u8> {

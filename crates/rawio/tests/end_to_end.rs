@@ -85,10 +85,27 @@ impl RawDevice for Handle {
 }
 
 fn run(args: &[&str], backend: &dyn Backend) -> (Result<(), Error>, String) {
+    let streams = run_streams(args, backend);
+    (streams.result, streams.out)
+}
+
+/// The two streams kept apart, for the tests that care which one a line took.
+struct Streams {
+    result: Result<(), Error>,
+    out: String,
+    diag: String,
+}
+
+fn run_streams(args: &[&str], backend: &dyn Backend) -> Streams {
     let cli = Cli::parse_from(args);
     let mut out = Vec::new();
-    let result = app::run(&cli, backend, &mut out, &Trace::new());
-    (result, String::from_utf8(out).expect("output is UTF-8"))
+    let mut diag = Vec::new();
+    let result = app::run(&cli, backend, &mut out, &mut diag, &Trace::new());
+    Streams {
+        result,
+        out: String::from_utf8(out).expect("output is UTF-8"),
+        diag: String::from_utf8(diag).expect("diagnostics are UTF-8"),
+    }
 }
 
 fn pit_image(entries: &[(&str, u32, u32)]) -> Vec<u8> {
@@ -191,7 +208,7 @@ fn partition_lookup_prints_the_resolved_range_before_use() {
 
     let dir = tempdir("pit");
     let output = dir.join("log.bin");
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "dump",
@@ -206,10 +223,11 @@ fn partition_lookup_prints_the_resolved_range_before_use() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
     assert!(
-        out.contains("pit: LOG spans 8192..12288 (4096 bytes)"),
-        "{out}"
+        run.diag.contains("pit: LOG spans 8192..12288 (4096 bytes)"),
+        "{}",
+        run.diag
     );
     assert_eq!(std::fs::read(&output).unwrap().len(), 4096);
 }
@@ -219,7 +237,7 @@ fn the_pit_command_prints_every_entry() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 0, &[("BOOT", 16, 8), ("LOG", 64, 128)]);
 
-    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+    let (result, out) = run(&["rawio", "show", "mem0", "--pit"], &backend);
 
     assert!(result.is_ok(), "{result:?}");
     assert!(out.contains("BOOT"), "{out}");
@@ -234,11 +252,17 @@ fn the_pit_can_be_read_from_somewhere_other_than_zero() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 4096, &[("LOG", 64, 128)]);
 
-    let (found, out) = run(&["rawio", "pit", "mem0", "--pit-offset", "4096"], &backend);
+    let (found, out) = run(
+        &["rawio", "show", "mem0", "--pit", "--pit-offset", "4096"],
+        &backend,
+    );
     assert!(found.is_ok(), "{found:?}");
     assert!(out.contains("LOG"), "{out}");
 
-    let (wrong, _) = run(&["rawio", "pit", "mem0", "--pit-offset", "8192"], &backend);
+    let (wrong, _) = run(
+        &["rawio", "show", "mem0", "--pit", "--pit-offset", "8192"],
+        &backend,
+    );
     assert!(matches!(wrong, Err(Error::Pit(_))), "{wrong:?}");
 }
 
@@ -250,11 +274,15 @@ fn a_pit_in_front_of_the_first_partition_is_found_without_an_offset() {
     write_mbr(&backend, &[(0x0c, 2048, 4096)]);
     write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
 
-    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+    let run = run_streams(&["rawio", "show", "mem0", "--pit"], &backend);
 
-    assert!(result.is_ok(), "{result:?} {out}");
-    assert!(out.contains("pit: found at offset 1048064"), "{out}");
-    assert!(out.contains("LOG"), "{out}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(
+        run.diag.contains("pit: found at offset 1048064"),
+        "{}",
+        run.diag
+    );
+    assert!(run.out.contains("LOG"), "{}", run.out);
 }
 
 /// Two copies in the same gap: the one the partition was written against is
@@ -266,7 +294,7 @@ fn the_copy_nearest_the_first_partition_is_the_one_reported() {
     write_pit(&backend, 512, &[("OLD", 64, 128)]);
     write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
 
-    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+    let (result, out) = run(&["rawio", "show", "mem0", "--pit"], &backend);
 
     assert!(result.is_ok(), "{result:?}");
     assert!(out.contains("LOG") && !out.contains("OLD"), "{out}");
@@ -279,11 +307,17 @@ fn the_search_stops_at_the_budget_and_says_how_to_carry_on() {
     write_mbr(&backend, &[(0x0c, 2048, 4096)]);
     write_pit(&backend, 12 << 20, &[("LOG", 64, 128)]);
 
-    let (stopped, _) = run(&["rawio", "pit", "mem0", "--pit-scan", "4K"], &backend);
+    let (stopped, _) = run(
+        &["rawio", "show", "mem0", "--pit", "--pit-scan", "4K"],
+        &backend,
+    );
     let message = stopped.unwrap_err().to_string();
     assert!(message.contains("--pit-scan"), "{message}");
 
-    let (found, out) = run(&["rawio", "pit", "mem0", "--pit-scan", "0"], &backend);
+    let (found, out) = run(
+        &["rawio", "show", "mem0", "--pit", "--pit-scan", "all"],
+        &backend,
+    );
     assert!(found.is_ok(), "{found:?}");
     assert!(out.contains("LOG"), "{out}");
 }
@@ -293,7 +327,7 @@ fn the_parts_command_prints_the_mbr_and_the_space_it_leaves() {
     let backend = FakeBackend::new(16 << 20, Removability::Removable);
     write_mbr(&backend, &[(0x0c, 2048, 4096), (0x83, 8192, 4096)]);
 
-    let (result, out) = run(&["rawio", "parts", "mem0"], &backend);
+    let (result, out) = run(&["rawio", "show", "mem0"], &backend);
 
     assert!(result.is_ok(), "{result:?}");
     assert!(out.contains("scheme=mbr"), "{out}");
@@ -312,7 +346,7 @@ fn a_range_resolves_from_an_mbr_entry_by_index() {
     write_mbr(&backend, &[(0x0c, 2048, 8)]);
     let output = tempdir("mbr").join("p1.bin");
 
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "dump",
@@ -325,9 +359,9 @@ fn a_range_resolves_from_an_mbr_entry_by_index() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?} {out}");
-    assert!(out.contains("parts: mbr #1"), "{out}");
-    assert!(out.contains("spans 1048576..1052672"), "{out}");
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.diag.contains("spans 1048576..1052672"), "{}", run.diag);
     assert_eq!(std::fs::read(&output).unwrap().len(), 4096);
 }
 
@@ -362,12 +396,12 @@ fn a_hybrid_layout_is_refused_until_the_scheme_is_named() {
     write_mbr(&backend, &[(0x0c, 2048, 4096)]);
     backend.device.borrow_mut().contents_mut()[512..520].copy_from_slice(b"EFI PART");
 
-    let (result, _) = run(&["rawio", "parts", "mem0"], &backend);
+    let (result, _) = run(&["rawio", "show", "mem0"], &backend);
 
     let message = result.unwrap_err().to_string();
     assert!(message.contains("--scheme"), "{message}");
 
-    let (named, out) = run(&["rawio", "parts", "mem0", "--scheme", "mbr"], &backend);
+    let (named, out) = run(&["rawio", "show", "mem0", "--scheme", "mbr"], &backend);
     assert!(named.is_ok(), "{named:?}");
     assert!(out.contains("scheme=mbr"), "{out}");
 }
@@ -377,7 +411,7 @@ fn an_entry_past_the_end_of_the_device_is_flagged() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 0, &[("SANE", 16, 8), ("BAD", 99_999_999, 1024)]);
 
-    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+    let (result, out) = run(&["rawio", "show", "mem0", "--pit"], &backend);
 
     assert!(result.is_ok(), "{result:?}");
     assert!(out.contains("beyond device"), "{out}");
@@ -433,7 +467,7 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
         &backend,
     );
     let by_id = dir.join("id.bin");
-    let (identified, out) = run(
+    let identified = run_streams(
         &[
             "rawio",
             "dump",
@@ -449,69 +483,62 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
     );
 
     assert!(named.is_ok(), "{named:?}");
-    assert!(identified.is_ok(), "{identified:?}");
-    assert!(out.contains("pit: LOG spans 32768..98304"), "{out}");
+    assert!(identified.result.is_ok(), "{:?}", identified.result);
+    assert!(
+        identified.diag.contains("pit: LOG spans 32768..98304"),
+        "{}",
+        identified.diag
+    );
     assert_eq!(
         std::fs::read(&by_name).unwrap(),
         std::fs::read(&by_id).unwrap()
     );
 }
 
+/// A flash that would be refused for being fixed is refused before anything
+/// is rehearsed: there is nothing to report about a write that cannot happen.
 #[test]
-fn probe_rehearses_the_volume_locks_a_write_would_need() {
-    let mut backend = FakeBackend::new(1 << 20, Removability::Removable);
-    backend.volumes = vec![
-        VolumeLock {
-            volume: "E:".into(),
-            locked: true,
-            error: None,
-        },
-        VolumeLock {
-            volume: "F:".into(),
-            locked: false,
-            error: Some(DeviceError::with_os_error(
-                Stage::LockVolume,
-                "access denied",
-                5,
-            )),
-        },
-    ];
-
-    let (result, out) = run(&["rawio", "probe", "mem0"], &backend);
-
-    assert!(result.is_ok(), "{result:?}");
-    assert!(out.contains("E:") && out.contains("F:"), "{out}");
-    assert!(out.contains("os error 5"), "{out}");
-    // The card is untouched either way.
-    assert!(backend.device.borrow().contents().iter().all(|b| *b == 0));
-}
-
-#[test]
-fn probe_does_not_rehearse_a_write_it_would_refuse() {
+fn a_dry_run_flash_refuses_a_fixed_disk_before_rehearsing() {
     let mut backend = FakeBackend::new(1 << 20, Removability::Fixed);
     backend.volumes = vec![VolumeLock {
         volume: "C:".into(),
         locked: true,
         error: None,
     }];
+    let input = tempdir("dryfixed").join("img.bin");
+    std::fs::write(&input, vec![0x5A; 512]).unwrap();
 
-    let (result, out) = run(&["rawio", "probe", "mem0"], &backend);
+    let (result, out) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "0",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
 
-    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::NotRemovable { .. })),
+        "{result:?}"
+    );
     assert!(!out.contains("C:"), "{out}");
-    assert!(out.to_lowercase().contains("not removable"), "{out}");
 }
 
 #[test]
-fn probe_reports_the_table_when_asked_for_it() {
+fn show_reads_the_pit_only_when_asked() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 0, &[("LOG", 64, 128)]);
 
-    let (without, quiet) = run(&["rawio", "probe", "mem0"], &backend);
+    let (without, quiet) = run(&["rawio", "show", "mem0"], &backend);
     assert!(without.is_ok(), "{without:?}");
     assert!(!quiet.contains("LOG"), "{quiet}");
 
-    let (with, loud) = run(&["rawio", "probe", "mem0", "--pit"], &backend);
+    let (with, loud) = run(&["rawio", "show", "mem0", "--pit"], &backend);
     assert!(with.is_ok(), "{with:?}");
     assert!(loud.contains("LOG"), "{loud}");
 }
@@ -924,7 +951,7 @@ fn a_length_larger_than_the_partition_is_rejected() {
 fn a_missing_table_says_where_it_looked() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
 
-    let (result, _) = run(&["rawio", "pit", "mem0"], &backend);
+    let (result, _) = run(&["rawio", "show", "mem0", "--pit"], &backend);
 
     let message = result.unwrap_err().to_string();
     assert!(message.contains("--pit-offset"), "{message}");
@@ -942,13 +969,16 @@ fn garbage_where_the_pit_should_be_fails_on_the_magic() {
         sector[4..8].copy_from_slice(&100_000u32.to_le_bytes()); // absurd count
     }
 
-    let (result, _) = run(&["rawio", "pit", "mem0", "--pit-offset", "0"], &backend);
+    let (result, _) = run(
+        &["rawio", "show", "mem0", "--pit", "--pit-offset", "0"],
+        &backend,
+    );
 
     let message = result.unwrap_err().to_string();
     assert!(message.contains("magic"), "{message}");
 
     // Without an offset the same garbage is simply never a candidate.
-    let (searched, _) = run(&["rawio", "pit", "mem0"], &backend);
+    let (searched, _) = run(&["rawio", "show", "mem0", "--pit"], &backend);
     assert!(searched.unwrap_err().to_string().contains("no PIT found"));
 }
 
@@ -1052,7 +1082,7 @@ fn hex_reads_the_partition_the_table_names() {
     write_mbr(&backend, &[(0x0c, 2048, 8)]);
     backend.device.borrow_mut().contents_mut()[1 << 20..(1 << 20) + 4].copy_from_slice(b"BOOT");
 
-    let (result, out) = run(
+    let run = run_streams(
         &[
             "rawio",
             "hex",
@@ -1065,9 +1095,9 @@ fn hex_reads_the_partition_the_table_names() {
         &backend,
     );
 
-    assert!(result.is_ok(), "{result:?}");
-    assert!(out.contains("parts: mbr #1"), "{out}");
-    assert!(out.contains("00100000  42 4f 4f 54"), "{out}");
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.out.contains("00100000  42 4f 4f 54"), "{}", run.out);
 }
 
 /// Most of a card is one repeated line, and printing all of them hides the one
@@ -1149,4 +1179,271 @@ fn hex_refuses_a_range_past_the_device_end() {
         matches!(result, Err(Error::InvalidArgument(_))),
         "{result:?}"
     );
+}
+
+/// A script reads stdout, and `rawio hex` exists to diff against the
+/// `hexdump -C` the reader already has. How the range was arrived at is for a
+/// person, so it takes stderr and leaves the dump alone.
+#[test]
+fn a_partition_hexdump_puts_nothing_but_the_dump_on_stdout() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+
+    let run = run_streams(&["rawio", "hex", "mem0", "--partition-id", "1"], &backend);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(run.out.starts_with("00100000"), "{}", run.out);
+    assert!(!run.out.contains("parts:"), "{}", run.out);
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+}
+
+/// The same rule for the PIT: a search prints where it looked and what it
+/// found, and none of that belongs in what a script parses.
+#[test]
+fn a_pit_search_reports_itself_on_stderr() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let run = run_streams(&["rawio", "show", "mem0", "--pit"], &backend);
+
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    assert!(!run.out.contains("pit: searching"), "{}", run.out);
+    assert!(!run.out.contains("pit: found at offset"), "{}", run.out);
+    assert!(run.diag.contains("pit: searching"), "{}", run.diag);
+    assert!(run.diag.contains("pit: found at offset"), "{}", run.diag);
+    assert!(run.out.contains("LOG"), "{}", run.out);
+}
+
+/// --pit-offset says where a PIT is. Which table a range comes from is what
+/// --scheme says, and letting the offset quietly decide it changed what
+/// `--partition-id 1` meant on a card that carries both.
+#[test]
+fn a_pit_offset_does_not_choose_the_table() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    write_pit(&backend, 4096, &[("LOG", 64, 128)]);
+
+    let (refused, _) = run(&["rawio", "show", "mem0", "--pit-offset", "4096"], &backend);
+    assert!(
+        matches!(refused, Err(Error::InvalidArgument(_))),
+        "{refused:?}"
+    );
+
+    // Said outright, the offset is honoured and the MBR is not consulted.
+    let (asked, out) = run(
+        &[
+            "rawio",
+            "show",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "4096",
+        ],
+        &backend,
+    );
+    assert!(asked.is_ok(), "{asked:?}");
+    assert!(out.contains("LOG"), "{out}");
+}
+
+/// `show --pit` reads one, so the offset has something to say there without
+/// a --scheme that would also redirect --partition.
+#[test]
+fn show_takes_a_pit_offset_alongside_the_partition_table() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    write_pit(&backend, 4096, &[("LOG", 64, 128)]);
+
+    let run = run_streams(
+        &[
+            "rawio",
+            "show",
+            "mem0",
+            "--pit",
+            "--pit-offset",
+            "4096",
+            "--partition-id",
+            "1",
+        ],
+        &backend,
+    );
+
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    // The MBR entry, not the PIT entry that also answers to 1.
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.out.contains("resolved: offset=1048576"), "{}", run.out);
+    assert!(run.out.contains("LOG"), "{}", run.out);
+}
+
+/// The default length is what the tool chose, not what the caller asked for.
+/// An entry smaller than a sector is printed whole rather than refused for
+/// exceeding a --length nobody typed.
+#[test]
+fn a_default_hex_length_yields_to_a_smaller_partition() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("TINY", 16, 0)]);
+
+    let run = run_streams(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "0",
+            "--partition",
+            "TINY",
+        ],
+        &backend,
+    );
+
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    assert_eq!(run.out, "00002000\n");
+}
+
+/// A length the caller did type is still checked against the partition, and
+/// the message names the flag they typed.
+#[test]
+fn a_hex_length_past_the_end_of_the_partition_is_refused() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+    write_pit(&backend, 0, &[("LOG", 16, 1)]);
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "0",
+            "--partition",
+            "LOG",
+            "--length",
+            "1K",
+        ],
+        &backend,
+    );
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("--length 1024"), "{message}");
+}
+
+/// "Would a flash be permitted here" is the question that costs a card to get
+/// wrong, so the command that would do the flashing is the one that answers it.
+#[test]
+fn a_dry_run_flash_rehearses_the_locks_the_real_one_would_take() {
+    let mut backend = FakeBackend::new(1 << 20, Removability::Removable);
+    backend.volumes = vec![
+        VolumeLock {
+            volume: "E:".into(),
+            locked: true,
+            error: None,
+        },
+        VolumeLock {
+            volume: "F:".into(),
+            locked: false,
+            error: Some(DeviceError::with_os_error(
+                Stage::LockVolume,
+                "access denied",
+                5,
+            )),
+        },
+    ];
+    let input = tempdir("dryrehearse").join("img.bin");
+    std::fs::write(&input, vec![0x5A; 4096]).unwrap();
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "0",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("dry-run: would write 4096 bytes"), "{out}");
+    assert!(out.contains("E:") && out.contains("F:"), "{out}");
+    assert!(out.contains("os error 5"), "{out}");
+    // The card is untouched, and no writable handle was asked of `open`.
+    assert!(backend.device.borrow().contents().iter().all(|b| *b == 0));
+    assert_eq!(*backend.opens.borrow(), vec![Access::Read]);
+}
+
+/// One command answers "what is this device and what does it carry". The table
+/// it detects costs a sector or two, so it is never behind a flag.
+#[test]
+fn show_prints_the_device_and_the_table_it_carries() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+
+    let (result, out) = run(&["rawio", "show", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("device: mem0"), "{out}");
+    assert!(out.contains("scheme=mbr"), "{out}");
+    assert!(out.contains("unallocated"), "{out}");
+}
+
+/// A device carrying no table it can read is a finding, not a failure: `show`
+/// is the command you run to find that out.
+#[test]
+fn show_reports_a_device_with_no_readable_table() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+
+    let (result, out) = run(&["rawio", "show", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("parts: none detected"), "{out}");
+}
+
+/// A scheme the caller asserted and the device does not carry is an error:
+/// detection finding nothing and an assertion being wrong are not the same.
+#[test]
+fn show_fails_on_a_scheme_the_device_does_not_carry() {
+    let backend = FakeBackend::new(1 << 20, Removability::Removable);
+
+    let (result, _) = run(&["rawio", "show", "mem0", "--scheme", "gpt"], &backend);
+
+    assert!(matches!(result, Err(Error::Parts(_))), "{result:?}");
+}
+
+/// The PIT stays opt-in because the search reads, and it is printed alongside
+/// the table the device carries rather than instead of it.
+#[test]
+fn show_adds_the_pit_when_asked() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let (quiet, without) = run(&["rawio", "show", "mem0"], &backend);
+    assert!(quiet.is_ok(), "{quiet:?}");
+    assert!(!without.contains("LOG"), "{without}");
+
+    let (loud, with) = run(&["rawio", "show", "mem0", "--pit"], &backend);
+    assert!(loud.is_ok(), "{loud:?}");
+    assert!(with.contains("scheme=mbr"), "{with}");
+    assert!(with.contains("LOG"), "{with}");
+}
+
+/// `show` names the device once. The table printers were standalone commands
+/// that each had to; now that show is their only caller, they must not.
+#[test]
+fn show_names_the_device_once() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let (result, out) = run(&["rawio", "show", "mem0", "--pit"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(out.matches("device: mem0").count(), 1, "{out}");
 }

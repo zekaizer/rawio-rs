@@ -5,23 +5,23 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::cli::{
-    Cli, Command, DumpArgs, FlashArgs, HexArgs, Location, PartsArgs, PitArgs, PitSource, ProbeArgs,
-    SchemeArg, TableSource, TransferOptions, VerifyArgs,
+    Cli, Command, DEFAULT_HEX_LENGTH, DumpArgs, FlashArgs, HexArgs, Location, SchemeArg, ShowArgs,
+    TableSource, TransferOptions, VerifyArgs,
 };
 use crate::hexdump::Hexdump;
 use crate::longpath;
 use crate::progress::{Bar, human_size};
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
 use rawio_core::error::{Error, Result};
-use rawio_core::parts::{self, DeviceSectors, Gap, Scheme, Table};
+use rawio_core::parts::{self, Detected, DeviceSectors, Gap, Scheme, Table};
 use rawio_core::pit::{self, ASSUMED_BLOCK_SIZE, Found, Pit};
 use rawio_core::progress::{Progress, Silent};
 use rawio_core::trace::Trace;
 use rawio_core::transfer;
 
-/// Which table the range comes from, once the arguments have been read.
-/// `--pit-offset` on its own says the PIT: asking where a table is only makes
-/// sense for the one format whose location is not fixed.
+/// Which table the range comes from, once the arguments have been read. Only
+/// `--scheme` decides this: `--pit-offset` says where a PIT is, not that a
+/// range should come from one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     Detect,
@@ -34,48 +34,45 @@ enum Source {
 struct Options {
     source: Source,
     pit_at: Option<u64>,
-    pit_scan: u64,
+    pit_scan: Option<u64>,
     dry_run: bool,
     progress: bool,
 }
 
 impl Options {
     /// A command that moves bytes: it can be rehearsed and it can report.
-    fn transfer(table: &TableSource, transfer: &TransferOptions) -> Self {
-        Self {
+    fn transfer(table: &TableSource, transfer: &TransferOptions) -> Result<Self> {
+        Ok(Self {
             dry_run: transfer.dry_run,
             progress: Bar::enabled(transfer.no_progress),
-            ..Self::inspect(table)
-        }
+            ..Self::inspect(table, false)?
+        })
     }
 
     /// A command that only looks: neither rehearsal nor progress applies.
-    fn inspect(table: &TableSource) -> Self {
+    /// `reads_a_pit` is what `probe --pit` sets, being the one command that
+    /// reads a PIT without resolving a range from it.
+    fn inspect(table: &TableSource, reads_a_pit: bool) -> Result<Self> {
         let source = match table.scheme {
             SchemeArg::Mbr => Source::Table(Scheme::Mbr),
             SchemeArg::Gpt => Source::Table(Scheme::Gpt),
             SchemeArg::Pit => Source::Pit,
-            SchemeArg::Auto if table.pit_source.pit_offset.is_some() => Source::Pit,
             SchemeArg::Auto => Source::Detect,
         };
-        Self {
+        if table.pit_source.pit_offset.is_some() && source != Source::Pit && !reads_a_pit {
+            return Err(Error::InvalidArgument(
+                "--pit-offset says where a PIT is, not which table to use; \
+                 add --scheme pit to resolve a range from one"
+                    .into(),
+            ));
+        }
+        Ok(Self {
             source,
             pit_at: table.pit_source.pit_offset,
-            pit_scan: table.pit_source.pit_scan,
+            pit_scan: table.pit_source.pit_scan.bytes(),
             dry_run: false,
             progress: false,
-        }
-    }
-
-    /// `rawio pit` fixes the scheme; only where to look is still an argument.
-    fn pit(pit: &PitSource) -> Self {
-        Self {
-            source: Source::Pit,
-            pit_at: pit.pit_offset,
-            pit_scan: pit.pit_scan,
-            dry_run: false,
-            progress: false,
-        }
+        })
     }
 
     fn bar(&self, label: &'static str) -> Box<dyn Progress> {
@@ -101,32 +98,43 @@ pub struct Range {
     pub length: Option<u64>,
 }
 
-pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
+/// `out` carries results, which a script reads. `diag` carries everything that
+/// only explains one: how a range was arrived at, and where a PIT was looked for.
+pub fn run(
+    cli: &Cli,
+    backend: &dyn Backend,
+    out: &mut dyn Write,
+    diag: &mut dyn Write,
+    trace: &Trace,
+) -> Result<()> {
     match &cli.command {
         Command::List => list(backend, out, trace),
-        Command::Probe(args) => probe(args, backend, out, trace, &Options::inspect(&args.table)),
-        Command::Parts(args) => {
-            parts_cmd(args, backend, out, trace, &Options::inspect(&args.table))
-        }
-        Command::Pit(args) => pit_cmd(args, backend, out, trace, &Options::pit(&args.pit_source)),
+        Command::Show(args) => show(
+            args,
+            backend,
+            out,
+            diag,
+            trace,
+            &Options::inspect(&args.table, args.pit)?,
+        ),
         Command::Hex(args) => {
             let opts = Options {
                 dry_run: args.dry_run,
-                ..Options::inspect(&args.table)
+                ..Options::inspect(&args.table, false)?
             };
-            hex(args, backend, out, trace, &opts)
+            hex(args, backend, out, diag, trace, &opts)
         }
         Command::Dump(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
-            dump(args, backend, out, trace, &opts)
+            let opts = Options::transfer(&args.table, &args.transfer)?;
+            dump(args, backend, out, diag, trace, &opts)
         }
         Command::Flash(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
-            flash(args, backend, out, trace, &opts)
+            let opts = Options::transfer(&args.table, &args.transfer)?;
+            flash(args, backend, out, diag, trace, &opts)
         }
         Command::Verify(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
-            verify(args, backend, out, trace, &opts)
+            let opts = Options::transfer(&args.table, &args.transfer)?;
+            verify(args, backend, out, diag, trace, &opts)
         }
     }
 }
@@ -143,68 +151,65 @@ fn list(backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()>
     Ok(())
 }
 
-/// Collects everything an on-site check needs, touching nothing.
-fn probe(
-    args: &ProbeArgs,
+/// What the device is and what it carries, in one place.
+fn show(
+    args: &ShowArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    let devices = backend.enumerate(trace)?;
-    for info in &devices {
-        writeln!(out, "device: {}", describe(info)).map_err(|e| Error::io("writing output", e))?;
-    }
+    let io = |e| Error::io("writing output", e);
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
     let info = device.info().clone();
-    writeln!(out, "target: {}", describe(&info)).map_err(|e| Error::io("writing output", e))?;
-    writeln!(out, "writable: {}", info.removability.writable())
-        .map_err(|e| Error::io("writing output", e))?;
-    rehearse(args, backend, out, trace, &info)?;
+    writeln!(out, "device: {}", describe(&info)).map_err(io)?;
+    writeln!(out, "writable: {}", info.removability.writable()).map_err(io)?;
 
-    if args.parts {
-        let table = read_table(&mut *device, opts, trace)?;
-        print_parts(out, &table, &info)?;
+    // Detection finding nothing is a finding. A scheme the caller asserted and
+    // the device does not carry, and a layout too ambiguous to conclude from,
+    // are both wrong-argument errors.
+    match opts.source {
+        Source::Pit => {}
+        Source::Table(_) => {
+            let table = read_table(&mut *device, opts, trace)?;
+            print_parts(out, &table, &info)?;
+        }
+        Source::Detect => match parts::detect(&mut DeviceSectors::new(&mut *device, trace))? {
+            Detected::Table(table) => print_parts(out, &table, &info)?,
+            Detected::None { reason } => {
+                writeln!(out, "parts: none detected - {reason}").map_err(io)?;
+            }
+        },
     }
 
-    if args.pit {
-        let found = locate_pit(&mut *device, out, trace, opts)?;
+    if args.pit || opts.source == Source::Pit {
+        // Two tables in one report need telling apart.
+        writeln!(out).map_err(io)?;
+        let found = locate_pit(&mut *device, diag, trace, opts)?;
         print_table(out, &found.pit, found.offset, &info)?;
     }
 
-    if let Some(range) = resolve(&mut *device, &args.location, None, out, trace, opts)? {
+    if let Some(location) = args.location.given() {
+        let range = resolve(&mut *device, location, None, diag, trace, opts)?;
         writeln!(
             out,
             "resolved: offset={} length={:?}",
             range.offset, range.length
         )
-        .map_err(|e| Error::io("writing output", e))?;
+        .map_err(io)?;
     }
     Ok(())
 }
 
 /// Runs the write path as far as it goes without writing, so the answer to
-/// "would a flash be permitted here" does not cost a card to find out.
-fn rehearse(
-    args: &ProbeArgs,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    trace: &Trace,
-    info: &DeviceInfo,
-) -> Result<()> {
+/// "would a flash be permitted here" does not cost a card to find out. Only
+/// reached once `ensure_writable` has passed.
+fn rehearse(device: &str, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
     let io = |e| Error::io("writing output", e);
 
-    if !info.removability.writable() {
-        return writeln!(
-            out,
-            "write rehearsal: skipped, {} is not removable and would be refused",
-            info.id
-        )
-        .map_err(io);
-    }
-
-    match backend.rehearse_write(&args.device, trace) {
+    match backend.rehearse_write(device, trace) {
         Err(err) => writeln!(out, "write rehearsal: no writable handle - {err}").map_err(io),
         Ok(volumes) if volumes.is_empty() => writeln!(
             out,
@@ -228,62 +233,27 @@ fn rehearse(
     }
 }
 
-/// Reads the table the device carries and nothing else.
-fn parts_cmd(
-    args: &PartsArgs,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    trace: &Trace,
-    opts: &Options,
-) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let info = device.info().clone();
-
-    if opts.source == Source::Pit {
-        let found = locate_pit(&mut *device, out, trace, opts)?;
-        return print_table(out, &found.pit, found.offset, &info);
-    }
-
-    let table = read_table(&mut *device, opts, trace)?;
-    print_parts(out, &table, &info)
-}
-
-/// Reads the PIT and nothing else.
-fn pit_cmd(
-    args: &PitArgs,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    trace: &Trace,
-    opts: &Options,
-) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let info = device.info().clone();
-    let found = locate_pit(&mut *device, out, trace, opts)?;
-    print_table(out, &found.pit, found.offset, &info)
-}
-
 /// Prints a range the way `hexdump -C` would. Nothing is written anywhere, so
 /// this is the one way to look at a structure before deciding what to do to it.
 fn hex(
     args: &HexArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
     let io = |e| Error::io("writing output", e);
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(
-        &mut *device,
-        &args.location,
-        Some(args.length),
-        out,
-        trace,
-        opts,
-    )?
-    .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
-    let length = range.length.unwrap_or(args.length);
+    let range = resolve(&mut *device, &args.location, args.length, diag, trace, opts)?;
+    // A partition shorter than a sector is printed whole; a length the caller
+    // typed is theirs, and was checked against the partition as it resolved.
+    let length = args.length.unwrap_or_else(|| {
+        range
+            .length
+            .map_or(DEFAULT_HEX_LENGTH, |whole| whole.min(DEFAULT_HEX_LENGTH))
+    });
 
     let end = transfer::check_read_range(device.info(), range.offset, length)?;
     if opts.dry_run {
@@ -306,12 +276,12 @@ fn dump(
     args: &DumpArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, args.length, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, args.length, diag, trace, opts)?;
     let length = range
         .length
         .ok_or_else(|| Error::InvalidArgument("--length is required with --offset".into()))?;
@@ -350,6 +320,7 @@ fn flash(
     args: &FlashArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -370,8 +341,7 @@ fn flash(
         .map_err(|e| Error::io(format!("stat {input:?}"), e))?
         .len();
 
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, None, diag, trace, opts)?;
     if let Some(limit) = range.length
         && input_len > limit
     {
@@ -382,12 +352,15 @@ fn flash(
 
     if opts.dry_run {
         let end = transfer::check_range(device.info(), range.offset, input_len)?;
-        return writeln!(
+        writeln!(
             out,
             "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{end}",
             args.device, range.offset,
         )
-        .map_err(|e| Error::io("writing output", e));
+        .map_err(|e| Error::io("writing output", e))?;
+        // The range is only half the answer: whether the OS would yield the
+        // volumes is the half that costs a card to get wrong.
+        return rehearse(&args.device, backend, out, trace);
     }
 
     let mut bar = opts.bar("flash");
@@ -428,6 +401,7 @@ fn verify(
     args: &VerifyArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
@@ -437,8 +411,7 @@ fn verify(
         .len();
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let range = resolve(&mut *device, &args.location, None, out, trace, opts)?
-        .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let range = resolve(&mut *device, &args.location, None, diag, trace, opts)?;
     if let Some(limit) = range.length
         && length > limit
     {
@@ -483,27 +456,31 @@ fn resolve(
     device: &mut dyn RawDevice,
     location: &Location,
     explicit_length: Option<u64>,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
-) -> Result<Option<Range>> {
+) -> Result<Range> {
     let selector = match (&location.partition, location.partition_id) {
         (Some(name), _) => Selector::Name(name),
         (None, Some(id)) => Selector::Id(id),
+        // The location group is required and exclusive, so this is the offset form.
         (None, None) => {
-            return Ok(location.offset.map(|offset| Range {
+            let offset = location
+                .offset
+                .expect("the location group admits nothing else");
+            return Ok(Range {
                 offset,
                 length: explicit_length,
-            }));
+            });
         }
     };
 
     if opts.source != Source::Pit {
-        return resolve_in_table(device, selector, explicit_length, out, trace, opts).map(Some);
+        return resolve_in_table(device, selector, explicit_length, diag, trace, opts);
     }
 
     let info = device.info().clone();
-    let table = locate_pit(device, out, trace, opts)?.pit;
+    let table = locate_pit(device, diag, trace, opts)?.pit;
     let partition = match selector {
         Selector::Name(name) => table.find(name)?,
         Selector::Id(id) => table.find_by_id(id)?,
@@ -512,7 +489,7 @@ fn resolve(
     let end = start.saturating_add(partition.byte_length());
 
     writeln!(
-        out,
+        diag,
         "pit: {} spans {start}..{end} ({} bytes) from block_offset={} block_count={} \
          device_type={} with block size {ASSUMED_BLOCK_SIZE} assumed",
         partition.name,
@@ -543,10 +520,10 @@ fn resolve(
         )));
     }
 
-    Ok(Some(Range {
+    Ok(Range {
         offset: start,
         length: Some(length),
-    }))
+    })
 }
 
 /// Resolves a range from the MBR or GPT, printing what it resolved to and
@@ -555,7 +532,7 @@ fn resolve_in_table(
     device: &mut dyn RawDevice,
     selector: Selector<'_>,
     explicit_length: Option<u64>,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<Range> {
@@ -567,7 +544,7 @@ fn resolve_in_table(
     };
 
     writeln!(
-        out,
+        diag,
         "parts: {} #{} {} spans {}..{} ({} bytes), type {}, from {}",
         table.scheme,
         partition.index,
@@ -620,7 +597,7 @@ fn read_table(device: &mut dyn RawDevice, opts: &Options, trace: &Trace) -> Resu
 /// wrong copy.
 fn locate_pit(
     device: &mut dyn RawDevice,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<Found> {
@@ -635,10 +612,10 @@ fn locate_pit(
         return Ok(Found { pit, offset: at });
     }
 
-    let gaps = search_space(device, out, trace)?;
+    let gaps = search_space(device, diag, trace)?;
     let found = pit::scan(&mut DeviceSectors::new(device, trace), &gaps, opts.pit_scan)?;
     writeln!(
-        out,
+        diag,
         "pit: found at offset {} by searching the space no partition covers",
         found.offset
     )
@@ -650,7 +627,7 @@ fn locate_pit(
 /// to speak of, so the whole of it is the search space.
 fn search_space(
     device: &mut dyn RawDevice,
-    out: &mut dyn Write,
+    diag: &mut dyn Write,
     trace: &Trace,
 ) -> Result<Vec<Gap>> {
     let size = device.info().size_bytes;
@@ -659,7 +636,7 @@ fn search_space(
         Ok(table) => table.gaps(size),
         Err(err) => {
             writeln!(
-                out,
+                diag,
                 "pit: no partition table to bound the search ({err}); searching from offset 0"
             )
             .map_err(|e| Error::io("writing output", e))?;
@@ -683,12 +660,14 @@ fn search_space(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    writeln!(out, "pit: searching {where_}").map_err(|e| Error::io("writing output", e))?;
+    writeln!(diag, "pit: searching {where_}").map_err(|e| Error::io("writing output", e))?;
     Ok(gaps)
 }
 
 /// The scheme, where the entries came from, and every range they resolve to -
 /// the whole point of the command is that this is printable without acting.
+/// `show` has already named the device; `info` is here for the size the
+/// entries are checked against.
 fn print_parts(out: &mut dyn Write, table: &Table, info: &DeviceInfo) -> Result<()> {
     let io = |e| Error::io("writing output", e);
 
@@ -700,7 +679,6 @@ fn print_parts(out: &mut dyn Write, table: &Table, info: &DeviceInfo) -> Result<
         table.partitions.len()
     )
     .map_err(io)?;
-    writeln!(out, "device: {}", describe(info)).map_err(io)?;
     writeln!(out).map_err(io)?;
     writeln!(
         out,
@@ -764,7 +742,6 @@ fn print_table(out: &mut dyn Write, table: &Pit, at: u64, info: &DeviceInfo) -> 
         "pit: block size {ASSUMED_BLOCK_SIZE} assumed; every byte column below depends on it"
     )
     .map_err(io)?;
-    writeln!(out, "device: {}", describe(info)).map_err(io)?;
     writeln!(out).map_err(io)?;
     writeln!(
         out,
