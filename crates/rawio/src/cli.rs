@@ -35,6 +35,8 @@ pub enum Command {
     Parts(PartsArgs),
     /// Print the PIT partition table. Reads only.
     Pit(PitArgs),
+    /// Print a raw range as a hexdump. Reads only.
+    Hex(HexArgs),
     /// Copy a raw range from the device into a file.
     Dump(DumpArgs),
     /// Write a file into a raw range on the device.
@@ -173,6 +175,41 @@ pub struct PitArgs {
     pub pit_source: PitSource,
 }
 
+/// What a hexdump prints when no length is given: one 512-byte sector, which is
+/// what the structures a hexdump gets opened for live in. A partition form
+/// supplies the offset, never a length that could be the whole card.
+pub const DEFAULT_HEX_LENGTH: u64 = 512;
+
+#[derive(Debug, Args)]
+pub struct HexArgs {
+    /// Device to read from, spelled as `rawio list` prints it.
+    pub device: String,
+
+    #[command(flatten)]
+    pub location: Location,
+
+    #[command(flatten)]
+    pub table: TableSource,
+
+    /// Bytes to print. The offset need not start on a sector.
+    #[arg(
+        long,
+        value_parser = parse_size,
+        value_name = "N",
+        default_value_t = DEFAULT_HEX_LENGTH,
+        help_heading = "Target"
+    )]
+    pub length: u64,
+
+    /// Print every line, including the runs of identical ones a `*` stands for.
+    #[arg(long)]
+    pub no_squeeze: bool,
+
+    /// Resolve the range and report it without reading the device.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct DumpArgs {
     /// Device to read from, spelled as `rawio list` prints it.
@@ -303,6 +340,11 @@ mod tests {
                 vec!["rawio", "probe", "d", "--no-progress"],
                 "probe --no-progress",
             ),
+            (
+                vec!["rawio", "hex", "d", "--no-progress"],
+                "hex --no-progress",
+            ),
+            (vec!["rawio", "hex", "d", "-o", "x"], "hex --output"),
         ];
         for (args, what) in nowhere {
             let err = Cli::try_parse_from(&args).unwrap_err();
@@ -333,6 +375,10 @@ mod tests {
                 "-o",
                 "x",
             ],
+            vec!["rawio", "hex", "d", "--offset", "0x1be", "--length", "16"],
+            vec!["rawio", "hex", "d", "--partition", "BOOT", "--no-squeeze"],
+            vec!["rawio", "hex", "d", "--partition-id", "1", "--dry-run"],
+            vec!["rawio", "hex", "d", "--offset", "0", "--scheme", "gpt"],
             vec!["rawio", "probe", "d", "--pit", "--pit-offset", "4K"],
             vec!["rawio", "probe", "d", "--partition", "LOG"],
             vec![
@@ -396,6 +442,7 @@ mod tests {
             vec![
                 "rawio", "dump", "d", "--offset", "0", "--length", "512", "-o", "x", "--trace",
             ],
+            vec!["rawio", "hex", "d", "--offset", "0", "--trace"],
             vec!["rawio", "flash", "d", "--offset", "0", "-i", "x", "--trace"],
             vec![
                 "rawio", "verify", "d", "--offset", "0", "-i", "x", "--trace",
@@ -408,7 +455,9 @@ mod tests {
 
     #[test]
     fn every_command_says_what_the_device_argument_is() {
-        for name in ["list", "probe", "parts", "pit", "dump", "flash", "verify"] {
+        for name in [
+            "list", "probe", "parts", "pit", "hex", "dump", "flash", "verify",
+        ] {
             let sub = Cli::command()
                 .get_subcommands()
                 .find(|c| c.get_name() == name)
@@ -464,6 +513,19 @@ mod tests {
         };
 
         assert_eq!(args.pit_source.pit_offset, None);
+    }
+
+    /// A hexdump is opened to look at one structure; defaulting to a whole
+    /// partition would print gigabytes at a terminal.
+    #[test]
+    fn a_hexdump_prints_one_sector_unless_told_otherwise() {
+        let cli = Cli::try_parse_from(["rawio", "hex", "d", "--offset", "0"]).unwrap();
+        let Command::Hex(args) = cli.command else {
+            panic!("expected hex")
+        };
+
+        assert_eq!(args.length, DEFAULT_HEX_LENGTH);
+        assert!(!args.no_squeeze);
     }
 
     #[test]

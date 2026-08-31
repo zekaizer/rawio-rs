@@ -1000,3 +1000,153 @@ fn tempdir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&base).unwrap();
     base
 }
+
+/// The dump is what `hexdump -C` prints of the same bytes, including the line
+/// that says where it stopped.
+#[test]
+fn hex_prints_the_bytes_at_the_offset_it_was_given() {
+    let backend = FakeBackend::new(4096, Removability::Removable);
+    backend.device.borrow_mut().contents_mut()[..16]
+        .copy_from_slice(b"\xeb\x3c\x90MSDOS5.0\x00\x02\x08\x20\x00");
+
+    let (result, out) = run(
+        &["rawio", "hex", "mem0", "--offset", "0", "--length", "16"],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        out,
+        "00000000  eb 3c 90 4d 53 44 4f 53  35 2e 30 00 02 08 20 00  |.<.MSDOS5.0... .|\n\
+         00000010\n"
+    );
+}
+
+/// A structure does not begin where its sector does, and looking at one is the
+/// whole point of the command.
+#[test]
+fn hex_starts_at_an_offset_no_sector_starts_at() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+
+    let (result, out) = run(
+        &[
+            "rawio", "hex", "mem0", "--offset", "0x1be", "--length", "16",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(
+        out.starts_with("000001be  00 00 00 00 0c 00 00 00"),
+        "{out}"
+    );
+    assert!(out.trim_end().ends_with("000001ce"), "{out}");
+}
+
+/// The partition forms resolve exactly as they do for a transfer, and say what
+/// they resolved to before a byte is printed.
+#[test]
+fn hex_reads_the_partition_the_table_names() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    backend.device.borrow_mut().contents_mut()[1 << 20..(1 << 20) + 4].copy_from_slice(b"BOOT");
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--partition-id",
+            "1",
+            "--length",
+            "16",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("parts: mbr #1"), "{out}");
+    assert!(out.contains("00100000  42 4f 4f 54"), "{out}");
+}
+
+/// Most of a card is one repeated line, and printing all of them hides the one
+/// that matters. The default length is one sector.
+#[test]
+fn hex_collapses_the_runs_a_card_is_mostly_made_of() {
+    let backend = FakeBackend::new(4096, Removability::Removable);
+
+    let (result, out) = run(&["rawio", "hex", "mem0", "--offset", "0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[1], "*");
+    assert_eq!(lines[2], "00000200");
+}
+
+#[test]
+fn hex_prints_every_line_when_the_squeeze_is_off() {
+    let backend = FakeBackend::new(4096, Removability::Removable);
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--offset",
+            "0",
+            "--length",
+            "64",
+            "--no-squeeze",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(out.lines().count(), 5, "{out}");
+    assert!(!out.contains('*'), "{out}");
+}
+
+/// A rehearsal reads nothing, which is the only way to check a range on a
+/// device that must not be touched.
+#[test]
+fn a_dry_run_hex_reads_nothing() {
+    let backend = FakeBackend::new(4096, Removability::Removable);
+    backend.device.borrow_mut().fail_reads_from(0);
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "hex",
+            "mem0",
+            "--offset",
+            "0",
+            "--length",
+            "32",
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("dry-run: would read 32 bytes"), "{out}");
+    assert!(!out.contains('|'), "{out}");
+}
+
+#[test]
+fn hex_refuses_a_range_past_the_device_end() {
+    let backend = FakeBackend::new(4096, Removability::Removable);
+
+    let (result, _) = run(
+        &[
+            "rawio", "hex", "mem0", "--offset", "4000", "--length", "512",
+        ],
+        &backend,
+    );
+
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}

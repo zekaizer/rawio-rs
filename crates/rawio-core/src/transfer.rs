@@ -127,14 +127,14 @@ pub fn check_read_range(info: &DeviceInfo, offset: u64, length: u64) -> Result<u
     Ok(end)
 }
 
-/// Reads `length` bytes from `offset` and hands them to `sink` in chunks, each
-/// with the device offset it starts at. Returns the number of bytes handed over.
+/// Reads `length` bytes from `offset` and hands them to `sink` in chunks, in
+/// order. Returns the number of bytes handed over.
 pub fn read_range(
     device: &mut dyn RawDevice,
     offset: u64,
     length: u64,
     trace: &Trace,
-    sink: &mut dyn FnMut(u64, &[u8]) -> Result<()>,
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<u64> {
     check_read_range(device.info(), offset, length)?;
     let sector = device.info().logical_sector_size;
@@ -159,7 +159,7 @@ pub fn read_range(
         })?;
         trace.ok(Stage::Read, format!("read {aligned}B at {start}"), "ok");
 
-        sink(at, &buf[head..head + want])?;
+        sink(&buf[head..head + want])?;
         done += want as u64;
     }
     Ok(done)
@@ -799,27 +799,17 @@ mod tests {
         device.contents_mut().copy_from_slice(&data);
 
         let mut seen = Vec::new();
-        let mut at = Vec::new();
-        let n = read_range(
-            &mut device,
-            100,
-            300,
-            &Trace::new(),
-            &mut |offset, bytes| {
-                at.push(offset);
-                seen.extend_from_slice(bytes);
-                Ok(())
-            },
-        )
+        let n = read_range(&mut device, 100, 300, &Trace::new(), &mut |bytes| {
+            seen.extend_from_slice(bytes);
+            Ok(())
+        })
         .unwrap();
 
         assert_eq!(n, 300);
-        assert_eq!(at, vec![100]);
         assert_eq!(seen, data[100..400]);
     }
 
-    /// A range longer than one chunk arrives in order and unbroken, with each
-    /// piece labelled by the offset it really came from.
+    /// A range longer than one chunk arrives in order and unbroken.
     #[test]
     fn a_read_range_longer_than_a_chunk_arrives_in_order() {
         let size = 3 * CHUNK;
@@ -829,19 +819,10 @@ mod tests {
 
         let want = 2 * CHUNK as u64 + 4096;
         let mut seen = Vec::new();
-        let mut next = 512u64;
-        let n = read_range(
-            &mut device,
-            512,
-            want,
-            &Trace::new(),
-            &mut |offset, bytes| {
-                assert_eq!(offset, next, "chunks arrive at consecutive offsets");
-                next += bytes.len() as u64;
-                seen.extend_from_slice(bytes);
-                Ok(())
-            },
-        )
+        let n = read_range(&mut device, 512, want, &Trace::new(), &mut |bytes| {
+            seen.extend_from_slice(bytes);
+            Ok(())
+        })
         .unwrap();
 
         assert_eq!(n, want);
@@ -853,8 +834,7 @@ mod tests {
         let mut device = MemoryDevice::new("mem0", 4096, Removability::Removable);
         device.fail_reads_from(0);
 
-        let err =
-            read_range(&mut device, 3900, 512, &Trace::new(), &mut |_, _| Ok(())).unwrap_err();
+        let err = read_range(&mut device, 3900, 512, &Trace::new(), &mut |_| Ok(())).unwrap_err();
 
         assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     }

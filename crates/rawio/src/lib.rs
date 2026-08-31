@@ -3,5 +3,6 @@
 
 pub mod app;
 pub mod cli;
+pub mod hexdump;
 pub mod longpath;
 pub mod progress;

@@ -5,9 +5,10 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::cli::{
-    Cli, Command, DumpArgs, FlashArgs, Location, PartsArgs, PitArgs, PitSource, ProbeArgs,
+    Cli, Command, DumpArgs, FlashArgs, HexArgs, Location, PartsArgs, PitArgs, PitSource, ProbeArgs,
     SchemeArg, TableSource, TransferOptions, VerifyArgs,
 };
+use crate::hexdump::Hexdump;
 use crate::longpath;
 use crate::progress::{Bar, human_size};
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
@@ -108,6 +109,13 @@ pub fn run(cli: &Cli, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace)
             parts_cmd(args, backend, out, trace, &Options::inspect(&args.table))
         }
         Command::Pit(args) => pit_cmd(args, backend, out, trace, &Options::pit(&args.pit_source)),
+        Command::Hex(args) => {
+            let opts = Options {
+                dry_run: args.dry_run,
+                ..Options::inspect(&args.table)
+            };
+            hex(args, backend, out, trace, &opts)
+        }
         Command::Dump(args) => {
             let opts = Options::transfer(&args.table, &args.transfer);
             dump(args, backend, out, trace, &opts)
@@ -252,6 +260,46 @@ fn pit_cmd(
     let info = device.info().clone();
     let found = locate_pit(&mut *device, out, trace, opts)?;
     print_table(out, &found.pit, found.offset, &info)
+}
+
+/// Prints a range the way `hexdump -C` would. Nothing is written anywhere, so
+/// this is the one way to look at a structure before deciding what to do to it.
+fn hex(
+    args: &HexArgs,
+    backend: &dyn Backend,
+    out: &mut dyn Write,
+    trace: &Trace,
+    opts: &Options,
+) -> Result<()> {
+    let io = |e| Error::io("writing output", e);
+
+    let mut device = backend.open(&args.device, Access::Read, trace)?;
+    let range = resolve(
+        &mut *device,
+        &args.location,
+        Some(args.length),
+        out,
+        trace,
+        opts,
+    )?
+    .ok_or_else(|| Error::InvalidArgument("--offset or --partition is required".into()))?;
+    let length = range.length.unwrap_or(args.length);
+
+    let end = transfer::check_read_range(device.info(), range.offset, length)?;
+    if opts.dry_run {
+        return writeln!(
+            out,
+            "dry-run: would read {length} bytes from {} at {}..{end} as a hexdump",
+            args.device, range.offset,
+        )
+        .map_err(io);
+    }
+
+    let mut dump = Hexdump::new(range.offset, end, !args.no_squeeze);
+    transfer::read_range(&mut *device, range.offset, length, trace, &mut |bytes| {
+        dump.push(bytes, out).map_err(io)
+    })?;
+    dump.finish(out).map_err(io)
 }
 
 fn dump(
