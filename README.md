@@ -207,6 +207,20 @@ write rehearsal: writable handle taken
 The rehearsal is skipped on a device that is not removable, since the write
 would be refused anyway.
 
+## Privileges
+
+Opening a physical disk needs privilege on both platforms, and rawio cannot take
+it for itself: a process cannot elevate its own token, and the elevated process a
+UAC prompt would start gets its own console, so nothing it prints comes back to
+the shell that asked for it. Run it from an elevated shell. Windows 11's
+`sudo.exe` works when it is configured for inline mode, which keeps stdout in the
+same console; the default new-window mode does not. `list` still works
+unelevated, through a query-only handle, and anything else fails with
+`access denied - run elevated` and exit code 3.
+
+On Linux the same access is a file permission: root, or a udev rule that hands
+the device to a group you are in.
+
 ## Safety
 
 `flash` refuses any device that is not reported as removable. There is no
