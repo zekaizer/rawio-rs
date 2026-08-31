@@ -11,7 +11,8 @@ use rawio_core::pit::DEFAULT_SCAN_BUDGET;
     about = concat!(
         "rawio ",
         env!("CARGO_PKG_VERSION"),
-        " - raw offset read/write for removable devices"
+        " - raw offset read/write for removable devices\nby ",
+        env!("CARGO_PKG_AUTHORS")
     )
 )]
 pub struct Cli {
@@ -308,12 +309,15 @@ mod tests {
 
     use super::*;
 
-    /// A build handed over on a USB stick has no other way to say what it is.
+    /// A build handed over on a USB stick has no other way to say what it is
+    /// or who to go back to about it.
     #[test]
-    fn help_names_the_version_it_was_built_from() {
+    fn help_names_the_version_and_the_author_it_was_built_from() {
         let help = Cli::command().render_long_help().to_string();
 
         assert!(help.contains(env!("CARGO_PKG_VERSION")), "{help}");
+        assert!(help.contains("Luke Lee"), "{help}");
+        assert!(help.contains(env!("CARGO_PKG_AUTHORS")), "{help}");
     }
 
     /// A flag that does nothing on a command should not be offered by it: the

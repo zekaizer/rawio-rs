@@ -2,6 +2,7 @@
 name = "rawio-core"
 description = "Raw offset read/write over removable block devices"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

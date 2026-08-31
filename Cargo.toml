@@ -4,6 +4,7 @@ members = ["crates/rawio", "crates/rawio-core"]
 
 [workspace.package]
 version = "0.1.0"
+authors = ["Luke Lee"]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
