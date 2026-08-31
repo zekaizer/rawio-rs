@@ -197,7 +197,7 @@ fn probe(
     writeln!(out, "target: {}", describe(&info)).map_err(|e| Error::io("writing output", e))?;
     writeln!(out, "writable: {}", info.removability.writable())
         .map_err(|e| Error::io("writing output", e))?;
-    rehearse(args, backend, out, trace, &info)?;
+    rehearse(&args.device, backend, out, trace, &info)?;
 
     if args.parts {
         let table = read_table(&mut *device, opts, trace)?;
@@ -224,7 +224,7 @@ fn probe(
 /// Runs the write path as far as it goes without writing, so the answer to
 /// "would a flash be permitted here" does not cost a card to find out.
 fn rehearse(
-    args: &ProbeArgs,
+    device: &str,
     backend: &dyn Backend,
     out: &mut dyn Write,
     trace: &Trace,
@@ -241,7 +241,7 @@ fn rehearse(
         .map_err(io);
     }
 
-    match backend.rehearse_write(&args.device, trace) {
+    match backend.rehearse_write(device, trace) {
         Err(err) => writeln!(out, "write rehearsal: no writable handle - {err}").map_err(io),
         Ok(volumes) if volumes.is_empty() => writeln!(
             out,
@@ -420,12 +420,15 @@ fn flash(
 
     if opts.dry_run {
         let end = transfer::check_range(device.info(), range.offset, input_len)?;
-        return writeln!(
+        writeln!(
             out,
             "dry-run: would write {input_len} bytes from {input:?} to {} at {}..{end}",
             args.device, range.offset,
         )
-        .map_err(|e| Error::io("writing output", e));
+        .map_err(|e| Error::io("writing output", e))?;
+        // The range is only half the answer: whether the OS would yield the
+        // volumes is the half that costs a card to get wrong.
+        return rehearse(&args.device, backend, out, trace, device.info());
     }
 
     let mut bar = opts.bar("flash");

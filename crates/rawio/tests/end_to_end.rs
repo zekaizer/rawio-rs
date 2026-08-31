@@ -1330,3 +1330,50 @@ fn a_hex_length_past_the_end_of_the_partition_is_refused() {
     let message = result.unwrap_err().to_string();
     assert!(message.contains("--length 1024"), "{message}");
 }
+
+/// "Would a flash be permitted here" is the question that costs a card to get
+/// wrong, so the command that would do the flashing is the one that answers it.
+#[test]
+fn a_dry_run_flash_rehearses_the_locks_the_real_one_would_take() {
+    let mut backend = FakeBackend::new(1 << 20, Removability::Removable);
+    backend.volumes = vec![
+        VolumeLock {
+            volume: "E:".into(),
+            locked: true,
+            error: None,
+        },
+        VolumeLock {
+            volume: "F:".into(),
+            locked: false,
+            error: Some(DeviceError::with_os_error(
+                Stage::LockVolume,
+                "access denied",
+                5,
+            )),
+        },
+    ];
+    let input = tempdir("dryrehearse").join("img.bin");
+    std::fs::write(&input, vec![0x5A; 4096]).unwrap();
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "flash",
+            "mem0",
+            "--offset",
+            "0",
+            "-i",
+            input.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("dry-run: would write 4096 bytes"), "{out}");
+    assert!(out.contains("E:") && out.contains("F:"), "{out}");
+    assert!(out.contains("os error 5"), "{out}");
+    // The card is untouched, and no writable handle was asked of `open`.
+    assert!(backend.device.borrow().contents().iter().all(|b| *b == 0));
+    assert_eq!(*backend.opens.borrow(), vec![Access::Read]);
+}
