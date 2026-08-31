@@ -19,9 +19,9 @@ use rawio_core::progress::{Progress, Silent};
 use rawio_core::trace::Trace;
 use rawio_core::transfer;
 
-/// Which table the range comes from, once the arguments have been read.
-/// `--pit-offset` on its own says the PIT: asking where a table is only makes
-/// sense for the one format whose location is not fixed.
+/// Which table the range comes from, once the arguments have been read. Only
+/// `--scheme` decides this: `--pit-offset` says where a PIT is, not that a
+/// range should come from one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     Detect,
@@ -41,30 +41,38 @@ struct Options {
 
 impl Options {
     /// A command that moves bytes: it can be rehearsed and it can report.
-    fn transfer(table: &TableSource, transfer: &TransferOptions) -> Self {
-        Self {
+    fn transfer(table: &TableSource, transfer: &TransferOptions) -> Result<Self> {
+        Ok(Self {
             dry_run: transfer.dry_run,
             progress: Bar::enabled(transfer.no_progress),
-            ..Self::inspect(table)
-        }
+            ..Self::inspect(table, false)?
+        })
     }
 
     /// A command that only looks: neither rehearsal nor progress applies.
-    fn inspect(table: &TableSource) -> Self {
+    /// `reads_a_pit` is what `probe --pit` sets, being the one command that
+    /// reads a PIT without resolving a range from it.
+    fn inspect(table: &TableSource, reads_a_pit: bool) -> Result<Self> {
         let source = match table.scheme {
             SchemeArg::Mbr => Source::Table(Scheme::Mbr),
             SchemeArg::Gpt => Source::Table(Scheme::Gpt),
             SchemeArg::Pit => Source::Pit,
-            SchemeArg::Auto if table.pit_source.pit_offset.is_some() => Source::Pit,
             SchemeArg::Auto => Source::Detect,
         };
-        Self {
+        if table.pit_source.pit_offset.is_some() && source != Source::Pit && !reads_a_pit {
+            return Err(Error::InvalidArgument(
+                "--pit-offset says where a PIT is, not which table to use; \
+                 add --scheme pit to resolve a range from one"
+                    .into(),
+            ));
+        }
+        Ok(Self {
             source,
             pit_at: table.pit_source.pit_offset,
             pit_scan: table.pit_source.pit_scan,
             dry_run: false,
             progress: false,
-        }
+        })
     }
 
     /// `rawio pit` fixes the scheme; only where to look is still an argument.
@@ -118,7 +126,7 @@ pub fn run(
             out,
             diag,
             trace,
-            &Options::inspect(&args.table),
+            &Options::inspect(&args.table, args.pit)?,
         ),
         Command::Parts(args) => parts_cmd(
             args,
@@ -126,7 +134,7 @@ pub fn run(
             out,
             diag,
             trace,
-            &Options::inspect(&args.table),
+            &Options::inspect(&args.table, false)?,
         ),
         Command::Pit(args) => pit_cmd(
             args,
@@ -139,20 +147,20 @@ pub fn run(
         Command::Hex(args) => {
             let opts = Options {
                 dry_run: args.dry_run,
-                ..Options::inspect(&args.table)
+                ..Options::inspect(&args.table, false)?
             };
             hex(args, backend, out, diag, trace, &opts)
         }
         Command::Dump(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
+            let opts = Options::transfer(&args.table, &args.transfer)?;
             dump(args, backend, out, diag, trace, &opts)
         }
         Command::Flash(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
+            let opts = Options::transfer(&args.table, &args.transfer)?;
             flash(args, backend, out, diag, trace, &opts)
         }
         Command::Verify(args) => {
-            let opts = Options::transfer(&args.table, &args.transfer);
+            let opts = Options::transfer(&args.table, &args.transfer)?;
             verify(args, backend, out, diag, trace, &opts)
         }
     }

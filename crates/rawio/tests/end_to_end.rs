@@ -1210,3 +1210,68 @@ fn a_pit_search_reports_itself_on_stderr() {
     assert!(run.diag.contains("pit: found at offset"), "{}", run.diag);
     assert!(run.out.contains("LOG"), "{}", run.out);
 }
+
+/// --pit-offset says where a PIT is. Which table a range comes from is what
+/// --scheme says, and letting the offset quietly decide it changed what
+/// `--partition-id 1` meant on a card that carries both.
+#[test]
+fn a_pit_offset_does_not_choose_the_table() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    write_pit(&backend, 4096, &[("LOG", 64, 128)]);
+
+    let (refused, _) = run(
+        &["rawio", "parts", "mem0", "--pit-offset", "4096"],
+        &backend,
+    );
+    assert!(
+        matches!(refused, Err(Error::InvalidArgument(_))),
+        "{refused:?}"
+    );
+
+    // Said outright, the offset is honoured and the MBR is not consulted.
+    let (asked, out) = run(
+        &[
+            "rawio",
+            "parts",
+            "mem0",
+            "--scheme",
+            "pit",
+            "--pit-offset",
+            "4096",
+        ],
+        &backend,
+    );
+    assert!(asked.is_ok(), "{asked:?}");
+    assert!(out.contains("LOG"), "{out}");
+}
+
+/// `probe --pit` reads one, so the offset has something to say there without
+/// a --scheme that would also redirect --partition.
+#[test]
+fn probe_takes_a_pit_offset_alongside_the_partition_table() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    write_pit(&backend, 4096, &[("LOG", 64, 128)]);
+
+    let run = run_streams(
+        &[
+            "rawio",
+            "probe",
+            "mem0",
+            "--parts",
+            "--pit",
+            "--pit-offset",
+            "4096",
+            "--partition-id",
+            "1",
+        ],
+        &backend,
+    );
+
+    assert!(run.result.is_ok(), "{:?} {}", run.result, run.diag);
+    // The MBR entry, not the PIT entry that also answers to 1.
+    assert!(run.diag.contains("parts: mbr #1"), "{}", run.diag);
+    assert!(run.out.contains("resolved: offset=1048576"), "{}", run.out);
+    assert!(run.out.contains("LOG"), "{}", run.out);
+}

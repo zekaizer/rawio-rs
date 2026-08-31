@@ -62,7 +62,9 @@ pub enum SchemeArg {
 #[derive(Debug, Args)]
 pub struct PitSource {
     /// Byte offset the PIT sits at. Without it the table is searched for in
-    /// the space no partition covers, nearest the first partition first.
+    /// the space no partition covers, nearest the first partition first. It
+    /// says where a PIT is, never that a range comes from one: that is what
+    /// --scheme pit says.
     #[arg(
         long,
         value_name = "N",
