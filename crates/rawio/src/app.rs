@@ -185,6 +185,8 @@ fn show(
     }
 
     if args.pit || opts.source == Source::Pit {
+        // Two tables in one report need telling apart.
+        writeln!(out).map_err(io)?;
         let found = locate_pit(&mut *device, diag, trace, opts)?;
         print_table(out, &found.pit, found.offset, &info)?;
     }
