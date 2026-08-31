@@ -1,7 +1,8 @@
 //! One argument surface, identical on both platforms, with no interactive input
 //! anywhere.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use rawio_core::pit::DEFAULT_SCAN_BUDGET;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,6 +31,8 @@ pub enum Command {
     List,
     /// Report everything needed to plan a transfer, without reading or writing.
     Probe(ProbeArgs),
+    /// Print the partition table the device carries. Reads only.
+    Parts(PartsArgs),
     /// Print the PIT partition table. Reads only.
     Pit(PitArgs),
     /// Copy a raw range from the device into a file.
@@ -40,24 +43,64 @@ pub enum Command {
     Verify(VerifyArgs),
 }
 
+/// Which table a range comes from. `auto` concludes only what the device
+/// proves: a protective entry means GPT, real MBR entries mean MBR, both at
+/// once is refused. It never lands on the PIT, whose location is an argument
+/// rather than a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SchemeArg {
+    Auto,
+    Mbr,
+    Gpt,
+    Pit,
+}
+
 /// Where to read the PIT from, for the commands that can read one.
 #[derive(Debug, Args)]
 pub struct PitSource {
-    /// Byte offset the PIT itself sits at. The format does not fix its
-    /// location, so it is an argument rather than a guess.
+    /// Byte offset the PIT sits at. Without it the table is searched for in
+    /// the space no partition covers, nearest the first partition first.
     #[arg(
         long,
         value_name = "N",
         value_parser = parse_size,
-        default_value_t = 0,
         help_heading = "Target"
     )]
-    pub pit_offset: u64,
+    pub pit_offset: Option<u64>,
+
+    /// Bytes of unallocated space the search may read before it gives up.
+    /// 0 lifts the cap; a full pass over a large card takes as long as
+    /// reading one.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_size,
+        default_value_t = DEFAULT_SCAN_BUDGET,
+        help_heading = "Target"
+    )]
+    pub pit_scan: u64,
+}
+
+/// The table a range is resolved from, for every command that resolves one.
+#[derive(Debug, Args)]
+pub struct TableSource {
+    /// Partition table to read: auto, mbr, gpt or pit.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SchemeArg::Auto,
+        value_name = "SCHEME",
+        help_heading = "Target"
+    )]
+    pub scheme: SchemeArg,
+
+    #[command(flatten)]
+    pub pit_source: PitSource,
 }
 
 /// What the range is, for every command that acts on one. The three forms are
 /// mutually exclusive, and the two partition forms are the only thing that
-/// makes the PIT be read at all.
+/// makes a partition table be read at all.
 #[derive(Debug, Args)]
 #[group(required = false, multiple = false)]
 pub struct Location {
@@ -65,11 +108,13 @@ pub struct Location {
     #[arg(long, value_parser = parse_size, value_name = "N", help_heading = "Target")]
     pub offset: Option<u64>,
 
-    /// Resolve the range from a PIT partition name, the NAME column of `rawio pit`.
+    /// Resolve the range from a partition name, the NAME column of `rawio parts`
+    /// or `rawio pit`. MBR entries have no names.
     #[arg(long, value_name = "NAME", help_heading = "Target")]
     pub partition: Option<String>,
 
-    /// Resolve the range from a PIT partition identifier, the ID column of `rawio pit`.
+    /// Resolve the range from the ID column of `rawio parts` or `rawio pit`:
+    /// the entry index under MBR and GPT, the identifier under a PIT.
     #[arg(long, value_name = "N", help_heading = "Target")]
     pub partition_id: Option<u32>,
 }
@@ -94,6 +139,10 @@ pub struct ProbeArgs {
     /// Device to report on, spelled as `rawio list` prints it.
     pub device: String,
 
+    /// Also read and print the partition table the device carries.
+    #[arg(long)]
+    pub parts: bool,
+
     /// Also read and print the PIT partition table.
     #[arg(long)]
     pub pit: bool,
@@ -103,7 +152,16 @@ pub struct ProbeArgs {
     pub location: Location,
 
     #[command(flatten)]
-    pub pit_source: PitSource,
+    pub table: TableSource,
+}
+
+#[derive(Debug, Args)]
+pub struct PartsArgs {
+    /// Device to read the partition table from, spelled as `rawio list` prints it.
+    pub device: String,
+
+    #[command(flatten)]
+    pub table: TableSource,
 }
 
 #[derive(Debug, Args)]
@@ -124,7 +182,7 @@ pub struct DumpArgs {
     pub location: Location,
 
     #[command(flatten)]
-    pub pit_source: PitSource,
+    pub table: TableSource,
 
     #[command(flatten)]
     pub transfer: TransferOptions,
@@ -147,7 +205,7 @@ pub struct FlashArgs {
     pub location: Location,
 
     #[command(flatten)]
-    pub pit_source: PitSource,
+    pub table: TableSource,
 
     #[command(flatten)]
     pub transfer: TransferOptions,
@@ -170,7 +228,7 @@ pub struct VerifyArgs {
     pub location: Location,
 
     #[command(flatten)]
-    pub pit_source: PitSource,
+    pub table: TableSource,
 
     #[command(flatten)]
     pub transfer: TransferOptions,
@@ -233,6 +291,9 @@ mod tests {
                 "list --pit-offset",
             ),
             (vec!["rawio", "list", "--offset", "0"], "list --offset"),
+            (vec!["rawio", "list", "--scheme", "mbr"], "list --scheme"),
+            (vec!["rawio", "pit", "d", "--scheme", "mbr"], "pit --scheme"),
+            (vec!["rawio", "parts", "d", "--dry-run"], "parts --dry-run"),
             (vec!["rawio", "pit", "d", "--dry-run"], "pit --dry-run"),
             (
                 vec!["rawio", "pit", "d", "--no-progress"],
@@ -257,6 +318,21 @@ mod tests {
     fn the_options_that_do_something_are_still_there() {
         let somewhere = [
             vec!["rawio", "pit", "d", "--pit-offset", "4K"],
+            vec!["rawio", "pit", "d", "--pit-scan", "0"],
+            vec!["rawio", "parts", "d"],
+            vec!["rawio", "parts", "d", "--scheme", "gpt"],
+            vec!["rawio", "probe", "d", "--parts"],
+            vec![
+                "rawio",
+                "dump",
+                "d",
+                "--scheme",
+                "mbr",
+                "--partition-id",
+                "1",
+                "-o",
+                "x",
+            ],
             vec!["rawio", "probe", "d", "--pit", "--pit-offset", "4K"],
             vec!["rawio", "probe", "d", "--partition", "LOG"],
             vec![
@@ -315,6 +391,7 @@ mod tests {
         let everywhere = [
             vec!["rawio", "list", "--trace"],
             vec!["rawio", "pit", "d", "--trace"],
+            vec!["rawio", "parts", "d", "--trace"],
             vec!["rawio", "probe", "d", "--trace"],
             vec![
                 "rawio", "dump", "d", "--offset", "0", "--length", "512", "-o", "x", "--trace",
@@ -331,7 +408,7 @@ mod tests {
 
     #[test]
     fn every_command_says_what_the_device_argument_is() {
-        for name in ["list", "probe", "pit", "dump", "flash", "verify"] {
+        for name in ["list", "probe", "parts", "pit", "dump", "flash", "verify"] {
             let sub = Cli::command()
                 .get_subcommands()
                 .find(|c| c.get_name() == name)
@@ -345,6 +422,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The default has to be the one that reads what is really there; a wrong
+    /// table resolving to a plausible range is what costs a card.
+    #[test]
+    fn the_scheme_defaults_to_auto() {
+        let cli = Cli::try_parse_from(["rawio", "parts", "d"]).unwrap();
+        let Command::Parts(args) = cli.command else {
+            panic!("expected parts")
+        };
+
+        assert_eq!(args.table.scheme, SchemeArg::Auto);
+        assert_eq!(args.table.pit_source.pit_offset, None);
+        assert_eq!(args.table.pit_source.pit_scan, DEFAULT_SCAN_BUDGET);
+    }
+
+    #[test]
+    fn every_scheme_is_spelled_the_way_the_output_spells_it() {
+        for (given, expected) in [
+            ("auto", SchemeArg::Auto),
+            ("mbr", SchemeArg::Mbr),
+            ("gpt", SchemeArg::Gpt),
+            ("pit", SchemeArg::Pit),
+        ] {
+            let cli = Cli::try_parse_from(["rawio", "parts", "d", "--scheme", given]).unwrap();
+            let Command::Parts(args) = cli.command else {
+                panic!("expected parts")
+            };
+            assert_eq!(args.table.scheme, expected, "{given}");
+        }
+        assert!(Cli::try_parse_from(["rawio", "parts", "d", "--scheme", "ebr"]).is_err());
+    }
+
+    /// The offset is what the search exists to avoid needing.
+    #[test]
+    fn the_pit_offset_is_optional() {
+        let cli = Cli::try_parse_from(["rawio", "pit", "d"]).unwrap();
+        let Command::Pit(args) = cli.command else {
+            panic!("expected pit")
+        };
+
+        assert_eq!(args.pit_source.pit_offset, None);
     }
 
     #[test]

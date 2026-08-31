@@ -196,6 +196,8 @@ fn partition_lookup_prints_the_resolved_range_before_use() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-o",
@@ -232,12 +234,142 @@ fn the_pit_can_be_read_from_somewhere_other_than_zero() {
     let backend = FakeBackend::new(1 << 20, Removability::Removable);
     write_pit(&backend, 4096, &[("LOG", 64, 128)]);
 
-    let (missing, _) = run(&["rawio", "pit", "mem0"], &backend);
-    assert!(matches!(missing, Err(Error::Pit(_))), "{missing:?}");
-
     let (found, out) = run(&["rawio", "pit", "mem0", "--pit-offset", "4096"], &backend);
     assert!(found.is_ok(), "{found:?}");
     assert!(out.contains("LOG"), "{out}");
+
+    let (wrong, _) = run(&["rawio", "pit", "mem0", "--pit-offset", "8192"], &backend);
+    assert!(matches!(wrong, Err(Error::Pit(_))), "{wrong:?}");
+}
+
+/// The card in hand: an MBR, and the PIT tucked into the space in front of the
+/// first partition where nothing points at it.
+#[test]
+fn a_pit_in_front_of_the_first_partition_is_found_without_an_offset() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?} {out}");
+    assert!(out.contains("pit: found at offset 1048064"), "{out}");
+    assert!(out.contains("LOG"), "{out}");
+}
+
+/// Two copies in the same gap: the one the partition was written against is
+/// the one a backwards search reaches first.
+#[test]
+fn the_copy_nearest_the_first_partition_is_the_one_reported() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 512, &[("OLD", 64, 128)]);
+    write_pit(&backend, 2047 * 512, &[("LOG", 64, 128)]);
+
+    let (result, out) = run(&["rawio", "pit", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("LOG") && !out.contains("OLD"), "{out}");
+}
+
+/// The search reads unallocated space, and how much of it is bounded.
+#[test]
+fn the_search_stops_at_the_budget_and_says_how_to_carry_on() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    write_pit(&backend, 12 << 20, &[("LOG", 64, 128)]);
+
+    let (stopped, _) = run(&["rawio", "pit", "mem0", "--pit-scan", "4K"], &backend);
+    let message = stopped.unwrap_err().to_string();
+    assert!(message.contains("--pit-scan"), "{message}");
+
+    let (found, out) = run(&["rawio", "pit", "mem0", "--pit-scan", "0"], &backend);
+    assert!(found.is_ok(), "{found:?}");
+    assert!(out.contains("LOG"), "{out}");
+}
+
+#[test]
+fn the_parts_command_prints_the_mbr_and_the_space_it_leaves() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096), (0x83, 8192, 4096)]);
+
+    let (result, out) = run(&["rawio", "parts", "mem0"], &backend);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(out.contains("scheme=mbr"), "{out}");
+    assert!(out.contains("0x0c"), "{out}");
+    // 2048 and 8192 sectors in, 4096 sectors long.
+    assert!(out.contains("1048576") && out.contains("4194304"), "{out}");
+    assert!(out.contains("unallocated 0..1048576"), "{out}");
+    assert!(out.contains("backwards"), "{out}");
+}
+
+/// MBR entries have no names, so the index is the only selector, and a range
+/// resolved from one is printed before it is read.
+#[test]
+fn a_range_resolves_from_an_mbr_entry_by_index() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    let output = tempdir("mbr").join("p1.bin");
+
+    let (result, out) = run(
+        &[
+            "rawio",
+            "dump",
+            "mem0",
+            "--partition-id",
+            "1",
+            "-o",
+            output.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    assert!(result.is_ok(), "{result:?} {out}");
+    assert!(out.contains("parts: mbr #1"), "{out}");
+    assert!(out.contains("spans 1048576..1052672"), "{out}");
+    assert_eq!(std::fs::read(&output).unwrap().len(), 4096);
+}
+
+#[test]
+fn an_mbr_name_lookup_says_which_selector_works() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 8)]);
+    let output = tempdir("mbrname").join("p1.bin");
+
+    let (result, _) = run(
+        &[
+            "rawio",
+            "dump",
+            "mem0",
+            "--partition",
+            "BOOT",
+            "-o",
+            output.to_str().unwrap(),
+        ],
+        &backend,
+    );
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("--partition-id"), "{message}");
+    assert!(!output.exists());
+}
+
+/// A card carrying both is ambiguous, and guessing is what costs a card.
+#[test]
+fn a_hybrid_layout_is_refused_until_the_scheme_is_named() {
+    let backend = FakeBackend::new(16 << 20, Removability::Removable);
+    write_mbr(&backend, &[(0x0c, 2048, 4096)]);
+    backend.device.borrow_mut().contents_mut()[512..520].copy_from_slice(b"EFI PART");
+
+    let (result, _) = run(&["rawio", "parts", "mem0"], &backend);
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("--scheme"), "{message}");
+
+    let (named, out) = run(&["rawio", "parts", "mem0", "--scheme", "mbr"], &backend);
+    assert!(named.is_ok(), "{named:?}");
+    assert!(out.contains("scheme=mbr"), "{out}");
 }
 
 #[test]
@@ -262,6 +394,8 @@ fn a_partition_past_the_end_of_the_device_aborts_before_any_io() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "BAD",
             "-o",
@@ -289,6 +423,8 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-o",
@@ -302,6 +438,8 @@ fn a_partition_id_selects_the_same_range_as_its_name() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition-id",
             "1",
             "-o",
@@ -389,6 +527,8 @@ fn an_unknown_partition_name_lists_the_ones_that_exist() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "NOPE",
             "-o",
@@ -416,6 +556,8 @@ fn flashing_a_partition_reports_how_much_of_it_was_used() {
             "rawio",
             "flash",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-i",
@@ -439,6 +581,8 @@ fn a_dry_run_dump_writes_no_file() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-o",
@@ -466,6 +610,8 @@ fn a_dry_run_flash_leaves_the_device_untouched() {
             "rawio",
             "flash",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-i",
@@ -676,6 +822,8 @@ fn verify_rejects_input_longer_than_the_partition() {
             "rawio",
             "verify",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-i",
@@ -753,6 +901,8 @@ fn a_length_larger_than_the_partition_is_rejected() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "--length",
@@ -792,11 +942,14 @@ fn garbage_where_the_pit_should_be_fails_on_the_magic() {
         sector[4..8].copy_from_slice(&100_000u32.to_le_bytes()); // absurd count
     }
 
-    let (result, _) = run(&["rawio", "pit", "mem0"], &backend);
+    let (result, _) = run(&["rawio", "pit", "mem0", "--pit-offset", "0"], &backend);
 
     let message = result.unwrap_err().to_string();
     assert!(message.contains("magic"), "{message}");
-    assert!(message.contains("--pit-offset"), "{message}");
+
+    // Without an offset the same garbage is simply never a candidate.
+    let (searched, _) = run(&["rawio", "pit", "mem0"], &backend);
+    assert!(searched.unwrap_err().to_string().contains("no PIT found"));
 }
 
 #[test]
@@ -810,6 +963,8 @@ fn a_device_without_a_pit_aborts_instead_of_transferring() {
             "rawio",
             "dump",
             "mem0",
+            "--scheme",
+            "pit",
             "--partition",
             "LOG",
             "-o",
@@ -820,6 +975,19 @@ fn a_device_without_a_pit_aborts_instead_of_transferring() {
 
     assert!(matches!(result, Err(Error::Pit(_))), "{result:?}");
     assert!(!output.exists());
+}
+
+/// `(type, first LBA, sectors)` in the primary slots, in order.
+fn write_mbr(backend: &FakeBackend, entries: &[(u8, u32, u32)]) {
+    let mut device = backend.device.borrow_mut();
+    let sector = &mut device.contents_mut()[..512];
+    sector[510..512].copy_from_slice(&[0x55, 0xAA]);
+    for (i, (kind, start, sectors)) in entries.iter().enumerate() {
+        let entry = &mut sector[446 + i * 16..][..16];
+        entry[4] = *kind;
+        entry[8..12].copy_from_slice(&start.to_le_bytes());
+        entry[12..16].copy_from_slice(&sectors.to_le_bytes());
+    }
 }
 
 fn write_pit(backend: &FakeBackend, at: usize, entries: &[(&str, u32, u32)]) {
