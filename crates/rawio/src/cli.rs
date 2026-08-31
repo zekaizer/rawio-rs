@@ -30,13 +30,8 @@ pub struct Cli {
 pub enum Command {
     /// List candidate devices.
     List,
-    /// Report everything needed to plan a transfer. Never writes.
-    Probe(ProbeArgs),
-    /// Print a partition table: the one the device carries, or the PIT under
-    /// --scheme pit. Reads only.
-    Parts(PartsArgs),
-    /// Print the PIT partition table. Reads only.
-    Pit(PitArgs),
+    /// Print what the device is and what it carries. Reads only.
+    Show(ShowArgs),
     /// Print a raw range as a hexdump. Reads only.
     Hex(HexArgs),
     /// Copy a raw range from the device into a file.
@@ -122,7 +117,7 @@ pub struct PitSource {
 #[derive(Debug, Args)]
 pub struct TableSource {
     /// Partition table a range comes from: auto, mbr, gpt, or pit for the
-    /// table `rawio pit` prints.
+    /// table `rawio show --pit` prints.
     #[arg(
         long,
         value_enum,
@@ -150,13 +145,13 @@ pub struct Location {
     #[arg(long, value_parser = parse_size, value_name = "N", help_heading = "Target")]
     pub offset: Option<u64>,
 
-    /// Resolve the range from a partition name, the NAME column of `rawio parts`
-    /// or `rawio pit`. MBR entries have no names.
+    /// Resolve the range from a partition name, the NAME column `rawio show`
+    /// prints. MBR entries have no names.
     #[arg(long, value_name = "NAME", help_heading = "Target")]
     pub partition: Option<String>,
 
-    /// Resolve the range from the ID column of `rawio parts` or `rawio pit`:
-    /// the entry index under MBR and GPT, the identifier under a PIT.
+    /// Resolve the range from the ID column `rawio show` prints: the entry
+    /// index under MBR and GPT, the identifier under a PIT.
     #[arg(long, value_name = "N", help_heading = "Target")]
     pub partition_id: Option<u32>,
 }
@@ -206,15 +201,12 @@ pub struct TransferOptions {
 }
 
 #[derive(Debug, Args)]
-pub struct ProbeArgs {
+pub struct ShowArgs {
     /// Device to report on, spelled as `rawio list` prints it.
     pub device: String,
 
-    /// Also read and print the partition table the device carries.
-    #[arg(long)]
-    pub parts: bool,
-
-    /// Also read and print the PIT partition table.
+    /// Also search for and print the PIT. Off by default: the search reads the
+    /// space no partition covers, up to --pit-scan.
     #[arg(long)]
     pub pit: bool,
 
@@ -224,24 +216,6 @@ pub struct ProbeArgs {
 
     #[command(flatten)]
     pub table: TableSource,
-}
-
-#[derive(Debug, Args)]
-pub struct PartsArgs {
-    /// Device to read the partition table from, spelled as `rawio list` prints it.
-    pub device: String,
-
-    #[command(flatten)]
-    pub table: TableSource,
-}
-
-#[derive(Debug, Args)]
-pub struct PitArgs {
-    /// Device to read the partition table from, spelled as `rawio list` prints it.
-    pub device: String,
-
-    #[command(flatten)]
-    pub pit_source: PitSource,
 }
 
 /// What a hexdump prints when no length is given: one 512-byte sector, which is
@@ -402,16 +376,10 @@ mod tests {
             ),
             (vec!["rawio", "list", "--offset", "0"], "list --offset"),
             (vec!["rawio", "list", "--scheme", "mbr"], "list --scheme"),
-            (vec!["rawio", "pit", "d", "--scheme", "mbr"], "pit --scheme"),
-            (vec!["rawio", "parts", "d", "--dry-run"], "parts --dry-run"),
-            (vec!["rawio", "pit", "d", "--dry-run"], "pit --dry-run"),
+            (vec!["rawio", "show", "d", "--dry-run"], "show --dry-run"),
             (
-                vec!["rawio", "pit", "d", "--no-progress"],
-                "pit --no-progress",
-            ),
-            (
-                vec!["rawio", "probe", "d", "--no-progress"],
-                "probe --no-progress",
+                vec!["rawio", "show", "d", "--no-progress"],
+                "show --no-progress",
             ),
             (
                 vec!["rawio", "hex", "d", "--no-progress"],
@@ -432,11 +400,10 @@ mod tests {
     #[test]
     fn the_options_that_do_something_are_still_there() {
         let somewhere = [
-            vec!["rawio", "pit", "d", "--pit-offset", "4K"],
-            vec!["rawio", "pit", "d", "--pit-scan", "all"],
-            vec!["rawio", "parts", "d"],
-            vec!["rawio", "parts", "d", "--scheme", "gpt"],
-            vec!["rawio", "probe", "d", "--parts"],
+            vec!["rawio", "show", "d", "--pit", "--pit-offset", "4K"],
+            vec!["rawio", "show", "d", "--pit", "--pit-scan", "all"],
+            vec!["rawio", "show", "d"],
+            vec!["rawio", "show", "d", "--scheme", "gpt"],
             vec![
                 "rawio",
                 "dump",
@@ -452,8 +419,7 @@ mod tests {
             vec!["rawio", "hex", "d", "--partition", "BOOT", "--no-squeeze"],
             vec!["rawio", "hex", "d", "--partition-id", "1", "--dry-run"],
             vec!["rawio", "hex", "d", "--offset", "0", "--scheme", "gpt"],
-            vec!["rawio", "probe", "d", "--pit", "--pit-offset", "4K"],
-            vec!["rawio", "probe", "d", "--partition", "LOG"],
+            vec!["rawio", "show", "d", "--partition", "LOG"],
             vec![
                 "rawio",
                 "dump",
@@ -509,9 +475,7 @@ mod tests {
     fn the_trace_is_available_everywhere() {
         let everywhere = [
             vec!["rawio", "list", "--trace"],
-            vec!["rawio", "pit", "d", "--trace"],
-            vec!["rawio", "parts", "d", "--trace"],
-            vec!["rawio", "probe", "d", "--trace"],
+            vec!["rawio", "show", "d", "--trace"],
             vec![
                 "rawio", "dump", "d", "--offset", "0", "--length", "512", "-o", "x", "--trace",
             ],
@@ -528,9 +492,7 @@ mod tests {
 
     #[test]
     fn every_command_says_what_the_device_argument_is() {
-        for name in [
-            "list", "probe", "parts", "pit", "hex", "dump", "flash", "verify",
-        ] {
+        for name in ["list", "show", "hex", "dump", "flash", "verify"] {
             let sub = Cli::command()
                 .get_subcommands()
                 .find(|c| c.get_name() == name)
@@ -550,9 +512,9 @@ mod tests {
     /// table resolving to a plausible range is what costs a card.
     #[test]
     fn the_scheme_defaults_to_auto() {
-        let cli = Cli::try_parse_from(["rawio", "parts", "d"]).unwrap();
-        let Command::Parts(args) = cli.command else {
-            panic!("expected parts")
+        let cli = Cli::try_parse_from(["rawio", "show", "d"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show")
         };
 
         assert_eq!(args.table.scheme, SchemeArg::Auto);
@@ -571,24 +533,24 @@ mod tests {
             ("gpt", SchemeArg::Gpt),
             ("pit", SchemeArg::Pit),
         ] {
-            let cli = Cli::try_parse_from(["rawio", "parts", "d", "--scheme", given]).unwrap();
-            let Command::Parts(args) = cli.command else {
-                panic!("expected parts")
+            let cli = Cli::try_parse_from(["rawio", "show", "d", "--scheme", given]).unwrap();
+            let Command::Show(args) = cli.command else {
+                panic!("expected show")
             };
             assert_eq!(args.table.scheme, expected, "{given}");
         }
-        assert!(Cli::try_parse_from(["rawio", "parts", "d", "--scheme", "ebr"]).is_err());
+        assert!(Cli::try_parse_from(["rawio", "show", "d", "--scheme", "ebr"]).is_err());
     }
 
     /// The offset is what the search exists to avoid needing.
     #[test]
     fn the_pit_offset_is_optional() {
-        let cli = Cli::try_parse_from(["rawio", "pit", "d"]).unwrap();
-        let Command::Pit(args) = cli.command else {
-            panic!("expected pit")
+        let cli = Cli::try_parse_from(["rawio", "show", "d", "--pit"]).unwrap();
+        let Command::Show(args) = cli.command else {
+            panic!("expected show")
         };
 
-        assert_eq!(args.pit_source.pit_offset, None);
+        assert_eq!(args.table.pit_source.pit_offset, None);
     }
 
     /// A hexdump is opened to look at one structure; defaulting to a whole
@@ -714,11 +676,11 @@ mod tests {
         }
     }
 
-    /// `probe` reports on the device itself, so it has nothing it must be told.
+    /// `show` reports on the device itself, so it has nothing it must be told.
     #[test]
-    fn probe_needs_no_range() {
-        assert!(Cli::try_parse_from(["rawio", "probe", "d"]).is_ok());
-        assert!(Cli::try_parse_from(["rawio", "probe", "d", "--parts"]).is_ok());
+    fn show_needs_no_range() {
+        assert!(Cli::try_parse_from(["rawio", "show", "d"]).is_ok());
+        assert!(Cli::try_parse_from(["rawio", "show", "d", "--pit"]).is_ok());
     }
 
     /// A budget of 0 meaning "no budget" is one keystroke from 0 meaning "read

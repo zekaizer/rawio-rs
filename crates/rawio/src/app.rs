@@ -5,15 +5,15 @@ use std::fs::File;
 use std::io::Write;
 
 use crate::cli::{
-    Cli, Command, DEFAULT_HEX_LENGTH, DumpArgs, FlashArgs, HexArgs, Location, PartsArgs, PitArgs,
-    PitSource, ProbeArgs, SchemeArg, TableSource, TransferOptions, VerifyArgs,
+    Cli, Command, DEFAULT_HEX_LENGTH, DumpArgs, FlashArgs, HexArgs, Location, SchemeArg, ShowArgs,
+    TableSource, TransferOptions, VerifyArgs,
 };
 use crate::hexdump::Hexdump;
 use crate::longpath;
 use crate::progress::{Bar, human_size};
 use rawio_core::device::{Access, Backend, DeviceInfo, RawDevice};
 use rawio_core::error::{Error, Result};
-use rawio_core::parts::{self, DeviceSectors, Gap, Scheme, Table};
+use rawio_core::parts::{self, Detected, DeviceSectors, Gap, Scheme, Table};
 use rawio_core::pit::{self, ASSUMED_BLOCK_SIZE, Found, Pit};
 use rawio_core::progress::{Progress, Silent};
 use rawio_core::trace::Trace;
@@ -75,17 +75,6 @@ impl Options {
         })
     }
 
-    /// `rawio pit` fixes the scheme; only where to look is still an argument.
-    fn pit(pit: &PitSource) -> Self {
-        Self {
-            source: Source::Pit,
-            pit_at: pit.pit_offset,
-            pit_scan: pit.pit_scan.bytes(),
-            dry_run: false,
-            progress: false,
-        }
-    }
-
     fn bar(&self, label: &'static str) -> Box<dyn Progress> {
         if self.progress {
             Box::new(Bar::new(label))
@@ -120,29 +109,13 @@ pub fn run(
 ) -> Result<()> {
     match &cli.command {
         Command::List => list(backend, out, trace),
-        Command::Probe(args) => probe(
+        Command::Show(args) => show(
             args,
             backend,
             out,
             diag,
             trace,
             &Options::inspect(&args.table, args.pit)?,
-        ),
-        Command::Parts(args) => parts_cmd(
-            args,
-            backend,
-            out,
-            diag,
-            trace,
-            &Options::inspect(&args.table, false)?,
-        ),
-        Command::Pit(args) => pit_cmd(
-            args,
-            backend,
-            out,
-            diag,
-            trace,
-            &Options::pit(&args.pit_source),
         ),
         Command::Hex(args) => {
             let opts = Options {
@@ -178,33 +151,40 @@ fn list(backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()>
     Ok(())
 }
 
-/// Collects everything an on-site check needs, touching nothing.
-fn probe(
-    args: &ProbeArgs,
+/// What the device is and what it carries, in one place.
+fn show(
+    args: &ShowArgs,
     backend: &dyn Backend,
     out: &mut dyn Write,
     diag: &mut dyn Write,
     trace: &Trace,
     opts: &Options,
 ) -> Result<()> {
-    let devices = backend.enumerate(trace)?;
-    for info in &devices {
-        writeln!(out, "device: {}", describe(info)).map_err(|e| Error::io("writing output", e))?;
-    }
+    let io = |e| Error::io("writing output", e);
 
     let mut device = backend.open(&args.device, Access::Read, trace)?;
     let info = device.info().clone();
-    writeln!(out, "target: {}", describe(&info)).map_err(|e| Error::io("writing output", e))?;
-    writeln!(out, "writable: {}", info.removability.writable())
-        .map_err(|e| Error::io("writing output", e))?;
-    rehearse(&args.device, backend, out, trace, &info)?;
+    writeln!(out, "device: {}", describe(&info)).map_err(io)?;
+    writeln!(out, "writable: {}", info.removability.writable()).map_err(io)?;
 
-    if args.parts {
-        let table = read_table(&mut *device, opts, trace)?;
-        print_parts(out, &table, &info)?;
+    // Detection finding nothing is a finding. A scheme the caller asserted and
+    // the device does not carry, and a layout too ambiguous to conclude from,
+    // are both wrong-argument errors.
+    match opts.source {
+        Source::Pit => {}
+        Source::Table(_) => {
+            let table = read_table(&mut *device, opts, trace)?;
+            print_parts(out, &table, &info)?;
+        }
+        Source::Detect => match parts::detect(&mut DeviceSectors::new(&mut *device, trace))? {
+            Detected::Table(table) => print_parts(out, &table, &info)?,
+            Detected::None { reason } => {
+                writeln!(out, "parts: none detected - {reason}").map_err(io)?;
+            }
+        },
     }
 
-    if args.pit {
+    if args.pit || opts.source == Source::Pit {
         let found = locate_pit(&mut *device, diag, trace, opts)?;
         print_table(out, &found.pit, found.offset, &info)?;
     }
@@ -216,30 +196,16 @@ fn probe(
             "resolved: offset={} length={:?}",
             range.offset, range.length
         )
-        .map_err(|e| Error::io("writing output", e))?;
+        .map_err(io)?;
     }
     Ok(())
 }
 
 /// Runs the write path as far as it goes without writing, so the answer to
-/// "would a flash be permitted here" does not cost a card to find out.
-fn rehearse(
-    device: &str,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    trace: &Trace,
-    info: &DeviceInfo,
-) -> Result<()> {
+/// "would a flash be permitted here" does not cost a card to find out. Only
+/// reached once `ensure_writable` has passed.
+fn rehearse(device: &str, backend: &dyn Backend, out: &mut dyn Write, trace: &Trace) -> Result<()> {
     let io = |e| Error::io("writing output", e);
-
-    if !info.removability.writable() {
-        return writeln!(
-            out,
-            "write rehearsal: skipped, {} is not removable and would be refused",
-            info.id
-        )
-        .map_err(io);
-    }
 
     match backend.rehearse_write(device, trace) {
         Err(err) => writeln!(out, "write rehearsal: no writable handle - {err}").map_err(io),
@@ -263,42 +229,6 @@ fn rehearse(
             Ok(())
         }
     }
-}
-
-/// Reads the table the device carries and nothing else.
-fn parts_cmd(
-    args: &PartsArgs,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    diag: &mut dyn Write,
-    trace: &Trace,
-    opts: &Options,
-) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let info = device.info().clone();
-
-    if opts.source == Source::Pit {
-        let found = locate_pit(&mut *device, diag, trace, opts)?;
-        return print_table(out, &found.pit, found.offset, &info);
-    }
-
-    let table = read_table(&mut *device, opts, trace)?;
-    print_parts(out, &table, &info)
-}
-
-/// Reads the PIT and nothing else.
-fn pit_cmd(
-    args: &PitArgs,
-    backend: &dyn Backend,
-    out: &mut dyn Write,
-    diag: &mut dyn Write,
-    trace: &Trace,
-    opts: &Options,
-) -> Result<()> {
-    let mut device = backend.open(&args.device, Access::Read, trace)?;
-    let info = device.info().clone();
-    let found = locate_pit(&mut *device, diag, trace, opts)?;
-    print_table(out, &found.pit, found.offset, &info)
 }
 
 /// Prints a range the way `hexdump -C` would. Nothing is written anywhere, so
@@ -428,7 +358,7 @@ fn flash(
         .map_err(|e| Error::io("writing output", e))?;
         // The range is only half the answer: whether the OS would yield the
         // volumes is the half that costs a card to get wrong.
-        return rehearse(&args.device, backend, out, trace, device.info());
+        return rehearse(&args.device, backend, out, trace);
     }
 
     let mut bar = opts.bar("flash");

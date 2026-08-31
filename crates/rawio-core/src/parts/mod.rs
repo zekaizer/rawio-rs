@@ -303,24 +303,45 @@ pub fn read(src: &mut dyn Sectors, scheme: Option<Scheme>) -> Result<Table> {
     match scheme {
         Some(Scheme::Mbr) => mbr::parse(src),
         Some(Scheme::Gpt) => gpt::parse(src),
-        None => detect(src),
+        // A range cannot come from a table that is not there, so an absence is
+        // an error here even though it is a finding to whoever is only looking.
+        None => match detect(src)? {
+            Detected::Table(table) => Ok(table),
+            Detected::None { reason } => Err(Error::Parts(reason)),
+        },
     }
 }
 
-fn detect(src: &mut dyn Sectors) -> Result<Table> {
+/// What [`detect`] concluded. A table that is ambiguous or damaged is an error
+/// from `detect` itself; this only tells a table apart from the absence of one,
+/// which is a thing a device is allowed to be.
+pub enum Detected {
+    Table(Table),
+    /// Nothing here can read, and what the caller might try instead.
+    None {
+        reason: String,
+    },
+}
+
+/// The table the device carries, if it carries one this can read. A hybrid
+/// layout is ambiguous rather than absent, and comes back as an error.
+pub fn detect(src: &mut dyn Sectors) -> Result<Detected> {
     let sector0 = src.read(0, 1)?;
 
     if !mbr::has_signature(&sector0) {
-        return gpt::parse(src).map_err(|err| {
-            Error::Parts(format!(
-                "no MBR signature at LBA 0 and no usable GPT ({err}); \
-                 pass --scheme pit if this device carries a PIT"
-            ))
-        });
+        return match gpt::parse(src) {
+            Ok(table) => Ok(Detected::Table(table)),
+            Err(err) => Ok(Detected::None {
+                reason: format!(
+                    "no MBR signature at LBA 0 and no usable GPT ({err}); \
+                     pass --scheme pit if this device carries a PIT"
+                ),
+            }),
+        };
     }
 
     if mbr::is_protective(&sector0) {
-        return gpt::parse(src);
+        return gpt::parse(src).map(Detected::Table);
     }
 
     let table = mbr::parse(src)?;
@@ -331,13 +352,13 @@ fn detect(src: &mut dyn Sectors) -> Result<Table> {
              is ambiguous, so pass --scheme mbr or --scheme gpt"
                 .into(),
         )),
-        (false, false) => Ok(table),
-        (true, true) => gpt::parse(src),
-        (true, false) => Err(Error::Parts(
-            "the MBR at LBA 0 has no partition entries and there is no GPT; \
-             pass --scheme mbr to see it anyway, or --scheme pit for a PIT"
+        (false, false) => Ok(Detected::Table(table)),
+        (true, true) => gpt::parse(src).map(Detected::Table),
+        (true, false) => Ok(Detected::None {
+            reason: "the MBR at LBA 0 has no partition entries and there is no GPT; \
+                     pass --scheme mbr to see it anyway, or --scheme pit for a PIT"
                 .into(),
-        )),
+        }),
     }
 }
 

@@ -4,7 +4,10 @@ Date: 2026-08-31
 
 ## Status
 
-Accepted
+Superseded in part by [ADR-3](0003-one-command-to-inspect-a-device.md): the
+`parts` command and the `--pit-offset` detection rule. Everything else here -
+`--scheme`, the MBR/GPT detection rules, the hybrid refusal, and how each table
+is validated and printed - still holds.
 
 ## Context
 
