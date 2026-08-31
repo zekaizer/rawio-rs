@@ -12,6 +12,7 @@ rawio list                                  # enumerate candidate devices
 rawio probe  <device> [--parts] [--pit]     # non-destructive pre-flight report
 rawio parts  <device>                       # print the MBR or GPT the card carries
 rawio pit    <device>                       # print the PIT partition table
+rawio hex    <device> <target> [--length N] # print a raw range as a hexdump
 rawio dump   <device> <target> --length N --output FILE
 rawio flash  <device> <target> --input FILE [--verify]
 rawio verify <device> <target> --input FILE
@@ -23,10 +24,10 @@ rather than rounded. A write whose length is not a multiple of the sector size
 reads the final sector back first, so the bytes after the image survive.
 
 `--dry-run` resolves the target, prints what would happen, and stops without
-reading or writing the device. It is offered by `dump`, `flash` and `verify`
-and by nothing else; the same goes for `--no-progress`, while `--scheme`,
-`--pit-offset` and `--pit-scan` are offered only by the commands that read a
-table. `--trace` is the one option every command takes.
+reading or writing the device. It is offered by `hex`, `dump`, `flash` and
+`verify` and by nothing else; `--no-progress` by the three that transfer, while
+`--scheme`, `--pit-offset` and `--pit-scan` are offered only by the commands
+that read a table. `--trace` is the one option every command takes.
 
 A progress line is drawn on stderr while a transfer runs, and only when stderr
 is a terminal, so a piped or redirected run stays quiet on its own. `--no-progress`
@@ -86,6 +87,44 @@ Partition types are printed as the table spells them — a hex byte under MBR, t
 type GUID under GPT — with no built-in name table to fall out of date. GPT is
 checked by CRC32 on both the header and the entry array, and falls back to the
 backup header, saying so when it does.
+
+## Looking at bytes
+
+`rawio hex` prints a range the way `hexdump -C` prints it — same columns, same
+`*` for a run of identical lines, same closing offset — so its output diffs
+against the tool every reader already has:
+
+```
+$ rawio hex \\.\PhysicalDrive2 --offset 0 --length 64
+00000000  eb 3c 90 4d 53 44 4f 53  35 2e 30 00 02 08 20 00  |.<.MSDOS5.0... .|
+00000010  02 00 02 00 00 f8 00 00  3f 00 ff 00 00 00 00 00  |........?.......|
+00000020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00000040
+```
+
+It takes every target form the transfer commands take, so a partition can be
+looked at by name or id without working out where it starts:
+
+```
+$ rawio hex \\.\PhysicalDrive2 --partition boot --length 32
+parts: gpt #1 boot spans 1048576..269484032 (268435456 bytes), type c12a7328-f81f-11d2-ba4b-00a0c93ec93b, from primary GPT header at LBA 1
+00100000  eb 58 90 6d 6b 66 73 2e  66 61 74 00 02 08 20 00  |.X.mkfs.fat... .|
+00100010  02 00 00 00 00 f8 00 00  3f 00 ff 00 00 08 00 00  |........?.......|
+00100020
+```
+
+Unlike a transfer the offset need not be a multiple of the sector size: the
+sector it falls in is read whole and the head discarded, so a structure can be
+looked at where it actually starts (`--offset 0x1be` for the first MBR entry).
+The length defaults to one 512-byte sector, including when a partition supplies
+the offset, so naming a 16 GiB partition never prints 16 GiB. `--no-squeeze`
+prints the lines a `*` stands for, and `--dry-run` reports the range it resolved
+without reading the device.
+
+Nothing decorative is added: the hexdump is the result, on stdout, and the only
+other line a run can print is the `parts:`/`pit:` line that says what a
+partition name resolved to.
 
 ## The PIT
 

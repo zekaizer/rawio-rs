@@ -15,6 +15,7 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
 ## Layout
 
 - `src/cli.rs` — argument surface; all parsing and validation, no I/O.
+- `src/hexdump.rs` — `hexdump -C` formatting; pure, no device access.
 - `src/error.rs` — `Stage`, `DeviceError`, `Error`, exit-code mapping.
 - `src/trace.rs` — per-step device access log (`--trace`).
 - `src/device.rs` — `RawDevice` / `Backend` traits, `DeviceInfo`, in-memory test double.
@@ -49,8 +50,11 @@ cargo clippy --target x86_64-pc-windows-gnu  # lint the Windows-only paths
   exception is `longpath::extend`, which adds the extended-length prefix when a
   path is at or beyond `MAX_PATH` and would otherwise be rejected outright.
 - Every command that acts on a range must be able to show what it resolved to
-  without acting: `--dry-run` on dump, flash and verify, and `rawio pit` for the
-  table. There are no interactive prompts to fall back on.
+  without acting: `--dry-run` on hex, dump, flash and verify, and `rawio pit`
+  for the table. There are no interactive prompts to fall back on.
+- `rawio hex` is `hexdump -C` byte for byte, so its output diffs against the
+  tool the reader already has. Its length defaults to one sector even when a
+  partition supplies the offset; a partition is never printed whole by default.
 - Scheme detection concludes only what a signature proves, and never lands on
   the PIT. A card carrying both a real MBR and a GPT aborts asking for an
   explicit `--scheme` rather than preferring one.
